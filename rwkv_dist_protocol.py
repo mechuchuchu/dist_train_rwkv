@@ -145,6 +145,7 @@ class RoundCoordinator:
         self.loss_tokens = 0
         self.loss_sum = 0.0
         self.closed = False
+        self.training_complete = False
         self.close_metrics: dict[str, Any] | None = None
         self.events: list[dict[str, Any]] = []
 
@@ -157,6 +158,7 @@ class RoundCoordinator:
                 "theta_version": self.theta_version,
                 "theta_hash": self.theta_hash,
                 "status": "closed" if self.closed else "open",
+                "training_complete": self.training_complete,
                 "base": self.base,
                 "tokenizer": self.tokenizer,
                 "worker_code_sha256": self.worker_code_sha256,
@@ -174,6 +176,21 @@ class RoundCoordinator:
     def snapshot_bytes(self) -> bytes:
         with self.lock:
             return encode_tensors(self.theta)
+
+    def signal_training_complete(self, reason: str = "training_finished") -> dict[str, Any]:
+        with self.lock:
+            if not self.closed:
+                raise ProtocolError("round_open", "cannot finish training while a round is open", 409)
+            if not self.training_complete:
+                self.training_complete = True
+                self.events.append({
+                    "event": "training_complete",
+                    "run_id": self.run_id,
+                    "round_id": self.round_id,
+                    "reason": reason[:256],
+                    "at": time.time(),
+                })
+            return {"training_complete": True, "run_id": self.run_id}
 
     def _expire_leases(self, now: float) -> None:
         for lease_id, lease in list(self.leases.items()):

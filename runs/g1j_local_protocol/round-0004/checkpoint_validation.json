@@ -1,0 +1,11 @@
+{
+  "adapter_reload": "passed",
+  "adapter_tensor_count": 192,
+  "adapter_max_abs_difference_vs_coordinator_theta": 0.0,
+  "probe_unit_id": "capybara-train-row-00001",
+  "probe_loss_tokens": 25,
+  "probe_loss_sum": 5.4732561111450195,
+  "probe_mean_loss": 0.21893024444580078,
+  "logits_finite": true,
+  "last_position_logits_sha256": "96dae7fff9b63d5c6a77d351d53a82739de0836255fac5a4a2e78ad48d245e61"
+}

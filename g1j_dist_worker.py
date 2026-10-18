@@ -9,11 +9,10 @@ import hashlib
 import json
 import os
 import signal
+import sys
 import threading
 import time
-import urllib.error
 import urllib.parse
-import urllib.request
 from pathlib import Path
 
 import torch
@@ -21,6 +20,14 @@ import torch.nn.functional as F
 from peft import LoraConfig, get_peft_model
 from transformers import AutoModelForCausalLM
 
+from rwkv_dist_client import (
+    Client,
+    CoordinatorHTTPError,
+    CoordinatorUnavailable,
+    CoordinatorWaitExpired,
+    CoordinatorWaiter,
+    WORKER_BUNDLE_FILES,
+)
 from rwkv_dist_protocol import (
     decode_tensors,
     encode_tensors,
@@ -28,6 +35,7 @@ from rwkv_dist_protocol import (
     tensor_map_sha256,
     unit_digest,
 )
+from rwkv_hub import ensure_hf_checkpoint
 
 
 MODEL_ID = "RWKV/RWKV7-G1j-1.5B-20260831"
@@ -38,43 +46,15 @@ TARGET_MODULES = ["att.receptance", "att.key", "att.value", "att.output"]
 
 def bundle_sha256(root: Path) -> str:
     digest = hashlib.sha256()
-    for name in ("g1j_dist_worker.py", "rwkv_dist_protocol.py"):
+    for name in WORKER_BUNDLE_FILES:
         digest.update(name.encode() + b"\0")
         digest.update((root / name).read_bytes())
     return digest.hexdigest()
 
 
-class Client:
-    def __init__(self, base_url: str, token: str):
-        self.base_url = base_url.rstrip("/")
-        self.token = token
-
-    def request(self, path: str, *, method="GET", body: bytes | None = None,
-                headers: dict[str, str] | None = None):
-        request_headers = {"Authorization": f"Bearer {self.token}"}
-        request_headers.update(headers or {})
-        request = urllib.request.Request(
-            self.base_url + path, data=body, headers=request_headers, method=method
-        )
-        try:
-            with urllib.request.urlopen(request, timeout=1800) as response:
-                return response.status, response.headers, response.read()
-        except urllib.error.HTTPError as exc:
-            payload = exc.read()
-            try:
-                detail = json.loads(payload)
-            except Exception:
-                detail = payload[:1000].decode("utf-8", "replace")
-            raise RuntimeError(f"HTTP {exc.code} for {path}: {detail}") from exc
-
-    def get_json(self, path: str):
-        _, _, body = self.request(path)
-        return json.loads(body)
-
-
-def load_worker_model() -> torch.nn.Module:
+def load_worker_model(model_path: Path) -> torch.nn.Module:
     model = AutoModelForCausalLM.from_pretrained(
-        str(MODEL_PATH),
+        str(model_path),
         trust_remote_code=True,
         local_files_only=True,
         use_safetensors=True,
@@ -171,13 +151,16 @@ def main() -> None:
     parser.add_argument("--token", default=os.environ.get("RWKV_PROTOCOL_TOKEN"))
     parser.add_argument("--worker-id", default=f"worker-{os.getpid()}")
     parser.add_argument("--model-path", type=Path, default=MODEL_PATH)
+    parser.add_argument("--fetch-model-from-hf", action="store_true",
+                        help="download the pinned model revision to --model-path before loading")
+    parser.add_argument("--hf-cache-dir", type=Path, default=None)
     parser.add_argument("--max-units", type=int, default=0, help="0 means drain the open round")
     parser.add_argument("--poll-seconds", type=float, default=1.0)
+    parser.add_argument("--coordinator-down-timeout-seconds", type=float, default=10800.0,
+                        help="stop after this much coordinator downtime; maximum is 10800 (3 hours)")
     args = parser.parse_args()
     if not args.token:
         parser.error("set --token or RWKV_PROTOCOL_TOKEN")
-    if args.model_path != MODEL_PATH:
-        raise ValueError("this first worker is pinned to the validated G1j 1.5B local model path")
     if not torch.cuda.is_available():
         raise RuntimeError("worker requires a CUDA GPU")
 
@@ -188,33 +171,67 @@ def main() -> None:
     signal.signal(signal.SIGTERM, request_shutdown)
 
     client = Client(args.server, args.token)
+    waiter = CoordinatorWaiter(
+        client,
+        max_wait_seconds=args.coordinator_down_timeout_seconds,
+        on_status=lambda status, waited, error: print(json.dumps({
+            "status": status,
+            "waited_seconds": round(waited, 1),
+            "detail": error,
+        }), flush=True),
+    )
     bundle_hash = bundle_sha256(Path(__file__).parent)
-    descriptor = client.get_json("/round")
+    descriptor = waiter.get_json("/round")
+    run_id = descriptor["run_id"]
     if descriptor["base"]["repo"] != MODEL_ID or descriptor["base"]["revision"] != MODEL_REVISION:
         raise RuntimeError("coordinator base model identity does not match this worker")
-    manifest_path = args.model_path / "release-manifest.json"
+    model_path = ensure_hf_checkpoint(
+        MODEL_ID, MODEL_REVISION, args.model_path,
+        fetch_from_hf=args.fetch_model_from_hf,
+        token=False,
+        cache_dir=args.hf_cache_dir,
+    )
+    manifest_path = model_path / "release-manifest.json"
     actual_model_hash = sha256_bytes(manifest_path.read_bytes())
     if descriptor["base"]["release_manifest_sha256"] != actual_model_hash:
         raise RuntimeError("local base weights do not match the coordinator's pinned manifest")
     if descriptor["worker_code_sha256"] != bundle_hash:
         raise RuntimeError("worker bundle hash does not match coordinator's pinned code")
-    if descriptor["status"] == "closed":
-        print(json.dumps({"status": "round_already_closed", "run_id": descriptor["run_id"]}))
+    if descriptor["training_complete"]:
+        print(json.dumps({"status": "training_complete", "run_id": run_id}), flush=True)
         return
 
     print(f"loading {MODEL_ID} on {torch.cuda.get_device_name(0)}", flush=True)
-    model = load_worker_model()
+    model = load_worker_model(model_path)
     params = trainable_parameters(model)
     loaded_theta_hash = None
     processed = 0
     while args.max_units == 0 or processed < args.max_units:
-        descriptor = client.get_json("/round")
+        descriptor = waiter.get_json("/round")
+        if descriptor["run_id"] != run_id:
+            raise RuntimeError(
+                f"coordinator run changed after reconnect: {run_id} -> {descriptor['run_id']}"
+            )
+        if descriptor["training_complete"]:
+            print(json.dumps({"status": "training_complete", "run_id": run_id,
+                              "processed_units": processed}), flush=True)
+            break
         if descriptor["status"] == "closed":
-            break
+            time.sleep(args.poll_seconds)
+            continue
         query = urllib.parse.urlencode({"worker_id": args.worker_id})
-        lease_response = client.get_json(f"/lease?{query}")
-        if lease_response["status"] == "round_closed":
+        lease_response = waiter.get_json(f"/lease?{query}")
+        if lease_response["status"] == "training_complete":
+            print(json.dumps({"status": "training_complete", "run_id": run_id,
+                              "processed_units": processed}), flush=True)
             break
+        if lease_response["status"] == "round_closed":
+            if lease_response.get("round", {}).get("training_complete"):
+                print(json.dumps({"status": "training_complete", "run_id": run_id,
+                                  "processed_units": processed}), flush=True)
+                break
+            time.sleep(args.poll_seconds)
+            continue
         if lease_response["status"] == "waiting":
             time.sleep(args.poll_seconds)
             continue
@@ -223,7 +240,7 @@ def main() -> None:
         if lease["theta_hash"] != descriptor["theta_hash"] or lease["theta_version"] != descriptor["theta_version"]:
             raise RuntimeError("lease was issued against a different adapter snapshot")
         if loaded_theta_hash != lease["theta_hash"]:
-            _, snapshot_headers, snapshot_payload = client.request("/snapshot")
+            _, snapshot_headers, snapshot_payload = waiter.request("/snapshot")
             header_hash = snapshot_headers.get("X-Theta-Hash")
             if header_hash != lease["theta_hash"]:
                 raise RuntimeError("snapshot response does not match leased theta hash")
@@ -234,7 +251,7 @@ def main() -> None:
         heartbeat_errors = []
 
         def heartbeat_loop():
-            interval = max(1.0, float(lease["lease_seconds"]) / 3.0)
+            interval = max(1.0, min(10.0, float(lease["lease_seconds"]) / 3.0))
             while not heartbeat_stop.wait(interval):
                 body = json.dumps({
                     "lease_id": lease["lease_id"],
@@ -242,8 +259,14 @@ def main() -> None:
                 }).encode()
                 try:
                     client.request("/heartbeat", method="POST", body=body,
-                                   headers={"Content-Type": "application/json"})
-                except Exception as exc:
+                                   headers={"Content-Type": "application/json"},
+                                   timeout=min(10.0, interval))
+                    waiter.note_recovered()
+                except CoordinatorUnavailable as exc:
+                    waiter.note_unavailable(exc)
+                    heartbeat_errors.append(str(exc))
+                    return
+                except CoordinatorHTTPError as exc:
                     heartbeat_errors.append(str(exc))
                     return
 
@@ -267,14 +290,16 @@ def main() -> None:
             try:
                 _, _, release_body = client.request(
                     "/release", method="POST", body=body,
-                    headers={"Content-Type": "application/json"},
+                    headers={"Content-Type": "application/json"}, timeout=10.0,
                 )
                 print(json.dumps({"status": "released", **json.loads(release_body)}), flush=True)
             except Exception as exc:
                 print(f"Could not release lease explicitly; it will expire: {exc}", flush=True)
             return
         if heartbeat_errors:
-            raise RuntimeError(f"lease heartbeat failed: {heartbeat_errors[0]}")
+            print(json.dumps({"status": "heartbeat_interrupted",
+                              "detail": heartbeat_errors[0],
+                              "action": "submit_result_or_reacquire_after_reconnect"}), flush=True)
         metadata = {
             "unit_id": unit["unit_id"],
             "unit_sha256": unit["unit_sha256"],
@@ -291,15 +316,26 @@ def main() -> None:
             "compute_seconds": round(time.perf_counter() - started, 4),
         }
         encoded_metadata = base64.urlsafe_b64encode(json.dumps(metadata, separators=(",", ":")).encode()).decode()
-        _, _, result_body = client.request(
-            "/result",
-            method="POST",
-            body=gradient_payload,
-            headers={
-                "Content-Type": "application/vnd.safetensors",
-                "X-Result-Metadata": encoded_metadata,
-            },
-        )
+        try:
+            _, _, result_body = waiter.request(
+                "/result",
+                method="POST",
+                body=gradient_payload,
+                headers={
+                    "Content-Type": "application/vnd.safetensors",
+                    "X-Result-Metadata": encoded_metadata,
+                },
+            )
+        except CoordinatorHTTPError as exc:
+            error_code = exc.detail.get("error") if isinstance(exc.detail, dict) else None
+            if exc.status == 409 and error_code in {
+                "unknown_lease", "expired_lease", "round_closed"
+            }:
+                print(json.dumps({"status": "result_discarded_lease_lost",
+                                  "unit_id": unit["unit_id"],
+                                  "error": error_code}), flush=True)
+                continue
+            raise
         result = json.loads(result_body)
         processed += 1
         print(json.dumps({
@@ -313,12 +349,12 @@ def main() -> None:
             "round_closed": result["round_closed"],
             "theta_hash": result["theta_hash"],
         }), flush=True)
-        if result["round_closed"]:
-            break
-
-    final = client.get_json("/round")
+    final = waiter.get_json("/round")
+    if final["run_id"] != run_id:
+        raise RuntimeError(f"coordinator run changed after reconnect: {run_id} -> {final['run_id']}")
     print(json.dumps({
         "status": final["status"],
+        "training_complete": final["training_complete"],
         "processed_units": processed,
         "received_units": final["received_units"],
         "received_loss_tokens": final["received_loss_tokens"],
@@ -327,4 +363,12 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except CoordinatorWaitExpired as exc:
+        print(json.dumps({
+            "status": "coordinator_wait_timeout",
+            "waited_seconds": round(exc.waited_seconds, 1),
+            "action": "worker_exit",
+        }), flush=True)
+        sys.exit(0)

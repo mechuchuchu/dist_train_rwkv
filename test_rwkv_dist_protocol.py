@@ -138,6 +138,21 @@ class RoundCoordinatorTests(unittest.TestCase):
         self.assertEqual(expired_unit_lease["unit"]["unit_id"], lease["unit"]["unit_id"])
         self.assertTrue(any(event["event"] == "lease_expired" for event in self.coordinator.events))
 
+    def test_training_completion_is_explicit_and_only_after_round_close(self):
+        with self.assertRaises(ProtocolError) as caught:
+            self.coordinator.signal_training_complete("too_early")
+        self.assertEqual(caught.exception.code, "round_open")
+
+        lease0 = self.coordinator.lease("worker-0")
+        lease1 = self.coordinator.lease("worker-1")
+        self.result(lease0, lease0["unit"], 1.0)
+        self.result(lease1, lease1["unit"], 3.0)
+        self.assertFalse(self.coordinator.descriptor()["training_complete"])
+        signal = self.coordinator.signal_training_complete("final_round_complete")
+        self.assertTrue(signal["training_complete"])
+        self.assertTrue(self.coordinator.descriptor()["training_complete"])
+        self.assertEqual(self.coordinator.events[-1]["event"], "training_complete")
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

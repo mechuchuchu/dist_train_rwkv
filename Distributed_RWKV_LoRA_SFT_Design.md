@@ -10,7 +10,9 @@
 
 HF Transformers 통합 체크포인트 `RWKV/RWKV7-G1j-1.5B-20260831`에서 실제 2-step TRL SFTTrainer, 4k/8k/16k 문맥 admission, summed-gradient canary 및 짧은 State-Tuning gradient 경로를 검증했다. 이 로컬 학습 canary 자체는 단일 프로세스 검사다. 별도로 구현한 첫 LoRA-SFT 분산 prototype의 범위와 한계는 [`G1j_1.5B_Training_Protocol_Validation_2026-10-18.md`](G1j_1.5B_Training_Protocol_Validation_2026-10-18.md)에 있다.
 
-LoRA SFT 분산 실행의 첫 prototype(`g1j_dist_coordinator.py`, `g1j_dist_worker.py`)은 현재 같은 1.5B HF 모델에서 두 worker 프로세스가 순차적으로 참여하는 HTTP round를 통과했다. lease·heartbeat/release·snapshot hash·gradient schema·중복/stale 거부·token-weighted 집계는 구현했지만, multi-round crash recovery, audit/canary, remote TLS는 남아 있다. 실행 기록은 위 validation note를 참조한다.
+LoRA SFT 분산 실행의 첫 prototype(`g1j_dist_coordinator.py`, `g1j_dist_worker.py`)은 현재 같은 1.5B HF 모델에서 두 worker 프로세스가 순차적으로 참여하는 HTTP round를 통과했다. coordinator와 worker는 고정된 HF repo/revision에서 `--fetch-model-from-hf`로 체크포인트를 받을 수 있고, worker 다운로드는 익명으로만 수행하며 coordinator는 unit manifest에 기록된 release-manifest SHA-256을 검사한다. coordinator 장애 시 worker는 최대 3시간 재접속을 기다리고, `training_complete` 신호를 받은 뒤 종료한다. lease·heartbeat/release·snapshot hash·gradient schema·중복/stale 거부·token-weighted 집계도 구현했다. multi-round crash recovery, audit/canary, remote TLS는 남아 있다. 실행 기록은 위 validation note를 참조한다.
+
+Coordinator는 `--push-adapter-to-hf --hf-adapter-repo <namespace/repo>`와 coordinator 전용 `HF_TOKEN`/`--hf-token`으로 저장된 adapter를 Hub에 올릴 수 있다. 새 theta 버전마다 `checkpoints/<run_id>/theta-<version>` 경로를 쓰며, adapter config에는 base model의 HF repo와 immutable revision을 기록한다. 업로드 파일은 PEFT config/weights와 provenance metadata뿐이며 optimizer, 학습 데이터, gradient payload는 포함하지 않는다. 새 저장소는 기본 private이고 public 생성은 `--hf-adapter-public`을 명시해야 한다. 현재 prototype은 단일 round이므로 자동 push도 실제 update 뒤 한 번이며, multi-round 지원 전까지 여러 학습 중간 시점이 생기지는 않는다. Worker CLI는 HF token을 받지 않고 다운로드도 인증을 끈 채 수행한다. push 실패는 학습을 중단시키지 않고 `coordinator_state.json`에 기록하며, 인증된 `POST /hub-push`로 재시도할 수 있다. 업로드는 백그라운드에서 진행해 worker의 결과 응답을 기다리게 하지 않는다.
 
 ## 0. 다중 checkpoint 지원 원칙
 
@@ -121,6 +123,7 @@ RWKV에는 transformer식 positional embedding의 고정 context limit이 없다
 - 초기 단일 GPU sweep: attention-only rank 4/8, `alpha/r` 1 또는 2, adapter LR `1e-4`–`3e-4` 범위, special token 행은 adapter와 같은 LR 및 별도 LR 모두 비교한다. 이 값들은 시작 탐색 범위이지 검증된 설정은 아니다.
 - Weight decay는 LoRA factor와 token rows에 기본 0으로 시작한다. 필요하면 validation 기준으로 별도 실험한다.
 - Worker에는 optimizer state가 없다. Coordinator checkpoint에는 모든 LoRA factor, `E_new/H_new`, optimizer state, base revision/hash, tokenizer/token-map hash, shard commit, code hash, round log를 저장한다.
+- Hub adapter publish는 coordinator 전용 write token을 사용한다. 버전별 adapter 경로에 config, weights, manifest hash와 theta/base provenance를 기록하되 optimizer state와 원본 학습물을 업로드하지 않는다. 공개 repo 생성은 명시적인 옵션으로만 허용하며, run의 각 adapter version을 저장한 뒤 push한다.
 - Inference export는 base model을 수정하지 않는 adapter safetensors와 token row/tokenizer extension을 묶는다. runtime loader는 frozen base 위에 LoRA branch를 계산한다. GGUF/rwkv.cpp로 배포하려면 먼저 adapter merge 및 변환 경로를 확인해야 하며, 원본 GGUF가 LoRA를 직접 로드한다고 가정하지 않는다.
 
 ## 7. QLoRA worker
