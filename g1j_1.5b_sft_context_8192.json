@@ -1,0 +1,42 @@
+{
+  "model": "RWKV/RWKV7-G1j-1.5B-20260831",
+  "model_revision": "2c18b29ab7fbece25ff6112281eea0fa41fcb30f",
+  "base_path": "/workspace/RWKV7-G1j-1.5B-20260831",
+  "gpu": "NVIDIA GeForce RTX 3060",
+  "dtype": "BF16 frozen base; FP32 attention LoRA factors",
+  "sequence_length_target": 8192,
+  "sequence_length_actual": 8191,
+  "target_modules": [
+    "att.receptance",
+    "att.key",
+    "att.value",
+    "att.output"
+  ],
+  "target_module_count": 96,
+  "trainable_parameters": 3145728,
+  "gradient_checkpointing": true,
+  "use_cache": false,
+  "logits_to_keep": 28,
+  "assistant_only_loss": true,
+  "template_end_of_turn_warning": "Current model chat template omits EOS from assistant loss mask; user plans a later template revision.",
+  "cuda_free_gib_before_step": 8.57,
+  "cuda_peak_allocated_gib": 7.174,
+  "cuda_peak_reserved_gib": 7.832,
+  "cuda_free_gib_after_step": 3.773,
+  "host_memory": {
+    "process_peak_rss_gib": 3.838,
+    "cgroup_current_gib": null,
+    "cgroup_limit_gib": null
+  },
+  "step": {
+    "status": "passed",
+    "loss_sum": 98.16117095947266,
+    "loss_tokens": 28,
+    "mean_loss": 3.505756105695452,
+    "gradient_global_norm_of_loss_sum": 290.6005554199219,
+    "finite_gradient_tensors": 192,
+    "optimizer_step_completed": true,
+    "forward_backward_optimizer_seconds": 33.369
+  },
+  "elapsed_seconds": 40.03
+}

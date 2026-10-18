@@ -164,3 +164,17 @@ T_candidate ≈ floor_to_multiple_of_16((0.85 × V_usable_GiB - 8.485) × 1024 /
 2. 24GB NF4: `T=2048→4096→8192`; 각 단계에 assistant-only labels, real loss, optimizer step을 포함한다.
 3. 48GB BF16: `T=1024→4096→8192`; 13.3B BF16 LoRA와 State Tuning을 별도 실행한다.
 4. 80GB BF16: `T=1024→4096→8192→16384→25600`; State Tuning은 먼저 짧은 `dS0` gradient parity를 통과한 뒤 길이를 올린다.
+
+## HF Transformers G1j 1.5B BF16 LoRA 실측
+
+`RWKV/RWKV7-G1j-1.5B-20260831`의 고정 revision `2c18b29ab7fbece25ff6112281eea0fa41fcb30f`(manifest SHA-256 `e16c761b3991134756b4bdd6a6663a3d161ee9cce4cad484ebb7586cc5e2169c`)을 RTX 3060 12 GiB에서 실측했다. BF16 frozen base, FP32 rank-8 attention-only LoRA(96 modules, 3,145,728 trainable parameters), gradient checkpointing, `use_cache=False`를 사용했다. 상세 범위, 짧은 TRL run, 분산 canary의 한계는 [`G1j_1.5B_Training_Protocol_Validation_2026-10-18.md`](G1j_1.5B_Training_Protocol_Validation_2026-10-18.md)에 있다.
+
+긴 문맥 실험은 매 step assistant target 28개만 `logits_to_keep`로 계산한 sparse-label capacity check다. 아래 결과는 임의의 label 밀도를 가진 실제 SFT row 전체의 admission으로 일반화하지 않는다.
+
+| Requested / actual context | Step result | Peak allocated / reserved | Step time |
+| ---: | --- | ---: | ---: |
+| 4,096 / 4,063 | 통과 | 5.03 / 5.367 GiB | 12.145 s |
+| 8,192 / 8,191 | 통과 | 7.174 / 7.832 GiB | 33.369 s |
+| 16,384 / 16,351 | OOM | 11.462 / 11.586 GiB observed | — |
+
+같은 revision에서 TRL `SFTTrainer`를 별도로 2 optimizer steps 실행해 assistant-only loss, attention-only target, adapter 저장 및 fresh-base 재로드를 확인했다. 16,384 training context는 12 GiB에서 실패했고 8,192는 해당 sparse-label 경로에서 통과했다. 이를 13.3B NF4 QLoRA의 context 기울기나 다른 model/backend tier의 결과와 혼합하지 않는다. 이 실험은 offload/DeepSpeed가 없으며 multiworker distributed training도 아니다.

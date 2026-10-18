@@ -1,0 +1,36 @@
+{
+  "model": "RWKV/RWKV7-G1j-1.5B-20260831",
+  "model_revision": "2c18b29ab7fbece25ff6112281eea0fa41fcb30f",
+  "base_path": "/workspace/RWKV7-G1j-1.5B-20260831",
+  "gpu": "NVIDIA GeForce RTX 3060",
+  "dtype": "BF16 frozen base; FP32 attention LoRA factors",
+  "sequence_length_target": 16384,
+  "sequence_length_actual": 16351,
+  "target_modules": [
+    "att.receptance",
+    "att.key",
+    "att.value",
+    "att.output"
+  ],
+  "target_module_count": 96,
+  "trainable_parameters": 3145728,
+  "gradient_checkpointing": true,
+  "use_cache": false,
+  "logits_to_keep": 28,
+  "assistant_only_loss": true,
+  "template_end_of_turn_warning": "Current model chat template omits EOS from assistant loss mask; user plans a later template revision.",
+  "cuda_free_gib_before_step": 8.568,
+  "cuda_peak_allocated_gib": 11.462,
+  "cuda_peak_reserved_gib": 11.586,
+  "cuda_free_gib_after_step": 0.646,
+  "host_memory": {
+    "process_peak_rss_gib": 3.826,
+    "cgroup_current_gib": null,
+    "cgroup_limit_gib": null
+  },
+  "step": {
+    "status": "oom",
+    "error": "CUDA out of memory. Tried to allocate 256.00 MiB. GPU 0 has a total capacity of 11.76 GiB of which 213.56 MiB is free. Process 1406825 has 11.54 GiB memory in use. Of the allocated memory 10.15 GiB is allocated by PyTorch, and 1.25 GiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://docs.pytorch.org/docs/stable/notes/cuda.html#optimizing-memory-usage-with-pytorch-cuda-alloc-conf)"
+  },
+  "elapsed_seconds": 23.944
+}

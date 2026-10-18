@@ -8,6 +8,8 @@
 
 HF 13.3B 설계의 hardware tier는 worker당 단일 GPU 기준이다. BF16 State Tuning reference는 H100 80GB급에서 시작하고, 48GB는 profile 후보로 둔다. 현재 12GB에서 통과한 짧은 NF4 QLoRA는 State Tuning admission 근거가 아니다. 자세한 sequence sweep과 VRAM 기준은 baseline의 [tier 계획](VRAM_Baseline_2026-10-18.md)을 따른다.
 
+1.5B HF 체크포인트에서 실제 chunked `Rwkv7Cache` initial-state gradient를 eager 경로와 비교한 짧은 canary가 통과했다. 단일 프로세스 worker-gradient 비교와 제한 사항은 [`G1j_1.5B_Training_Protocol_Validation_2026-10-18.md`](G1j_1.5B_Training_Protocol_Validation_2026-10-18.md)에 기록했다. 이는 긴 문맥 State-Tuning admission이나 분산 round 구현을 검증하지 않는다.
+
 ## 1. 목표와 범위
 
 ### 목표

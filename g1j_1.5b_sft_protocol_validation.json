@@ -1,0 +1,70 @@
+{
+  "model": {
+    "repo": "RWKV/RWKV7-G1j-1.5B-20260831",
+    "revision": "2c18b29ab7fbece25ff6112281eea0fa41fcb30f",
+    "path": "/workspace/RWKV7-G1j-1.5B-20260831",
+    "release_manifest_sha256": "e16c761b3991134756b4bdd6a6663a3d161ee9cce4cad484ebb7586cc5e2169c",
+    "dtype": "bfloat16 base; fp32 LoRA master factors",
+    "layers": 24,
+    "hidden_size": 2048,
+    "num_heads": 32,
+    "head_dim": 64,
+    "training_context": 16384,
+    "serialized_base_parameter_count": 1527668736
+  },
+  "dataset": {
+    "repo": "trl-lib/Capybara",
+    "revision": "e235e846458bff3398a88aed812347f7f0756520",
+    "split": "train[:32]",
+    "row_indices": [
+      1,
+      16,
+      21,
+      25
+    ],
+    "format": "conversational messages",
+    "assistant_only_loss": true,
+    "first_collated_batch_input_tokens": 54,
+    "first_collated_batch_loss_tokens_after_causal_shift": 25,
+    "selected_examples_template_assistant_tokens": 190
+  },
+  "software": {
+    "torch": "2.14.1+cu126",
+    "torch_cuda": "12.6",
+    "transformers": "5.20.1",
+    "trl": "1.16.0",
+    "peft": "0.21.2",
+    "datasets": "5.1.0"
+  },
+  "lora": {
+    "targets": [
+      "att.receptance",
+      "att.key",
+      "att.value",
+      "att.output"
+    ],
+    "target_module_count": 96,
+    "trainable_parameter_count": 3145728,
+    "changed_trainable_tensors": 192,
+    "rank": 8,
+    "alpha": 16,
+    "dropout": 0
+  },
+  "training": {
+    "max_steps": 2,
+    "global_step": 2,
+    "last_logged_loss": 0.9789381325244904,
+    "elapsed_seconds": 4.032,
+    "optimizer_step_completed": true,
+    "adapter_saved": true,
+    "adapter_reload_logits_max_abs_diff": 1.0,
+    "adapter_reload_logits_relative_rms_diff": 0.004584493115544319,
+    "adapter_reload_logits_cosine": 0.9999936819076538,
+    "adapter_reload_top_token_match": true,
+    "adapter_reload_passed": true,
+    "cuda_peak_allocated_gib": 2.936,
+    "cuda_peak_reserved_gib": 3.021,
+    "cuda_free_gib_after_reload": 8.521
+  },
+  "wall_seconds_including_dataset_load_and_reload": 12.512
+}

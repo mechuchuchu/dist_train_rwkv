@@ -8,6 +8,8 @@
 
 현재 HF Transformers attention-only 13.3B profile과 GPU VRAM tier 결정은 [`Distributed_RWKV_HF_Transformers_Design.md`](Distributed_RWKV_HF_Transformers_Design.md) 및 baseline의 [VRAM tier 계획](VRAM_Baseline_2026-10-18.md)에 정리했다. 기준 설계는 12GB에서 짧은 NF4 QLoRA, 13.3B BF16 LoRA의 H100 80GB reference worker이며, 실행 경로별 수치를 서로 대체하지 않는다.
 
+HF Transformers 통합 체크포인트 `RWKV/RWKV7-G1j-1.5B-20260831`에서 실제 2-step TRL SFTTrainer, 4k/8k/16k 문맥 admission, summed-gradient canary 및 짧은 State-Tuning gradient 경로를 검증했다. 결과와 한계는 [`G1j_1.5B_Training_Protocol_Validation_2026-10-18.md`](G1j_1.5B_Training_Protocol_Validation_2026-10-18.md)에 있다. 이는 단일 프로세스 검증이며 coordinator/worker 분산 protocol 구현 완료를 뜻하지 않는다.
+
 ## 0. 다중 checkpoint 지원 원칙
 
 - 7B/13.3B는 모델 선택 label이며 코드는 고정된 layer 수나 폭을 쓰지 않는다. 실제 체크포인트에서 `L=n_layer`, `D=n_embd`, WKV `H=n_head`, `N=head_size`, 각 linear의 `in/out_features`, base vocab `V`, embedding/head shape 및 tied 여부, 학습 context metadata를 읽는다. 모델별 config, tokenizer와 training code가 호환되는 RWKV-7 계열인지도 확인한다.

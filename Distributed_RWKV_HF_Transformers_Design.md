@@ -12,6 +12,8 @@ The tested environment is `/venv/main`: PyTorch 2.14.1+cu126, Transformers 5.20.
 
 Hardware selection is VRAM-tiered in [`VRAM_Baseline_2026-10-18.md`](VRAM_Baseline_2026-10-18.md). For this 13.3B checkpoint, short-context NF4 QLoRA is already measured on 12 GiB; BF16 LoRA and State Tuning use an 80GB-class GPU (H100 as the primary reference) as the design target. A 48GB GPU is a lower-tier BF16 candidate pending admission. H100 is therefore the reference for the higher-memory recipe, not a blanket requirement for every 13.3B task. All VRAM tiers are per worker; this protocol does not currently combine multiple GPUs inside one worker.
 
+The smaller integrated Transformers checkpoint `RWKV/RWKV7-G1j-1.5B-20260831` has since passed a short TRL SFT run, a sparse-label 8k LoRA step, and a short initial-state gradient canary. See [`G1j_1.5B_Training_Protocol_Validation_2026-10-18.md`](G1j_1.5B_Training_Protocol_Validation_2026-10-18.md). These checks validate local training paths only; full distributed protocol and 13.3B CPU-offload training remain unimplemented/unvalidated.
+
 ## 2. NF4 quantization and measured placement
 
 Use NF4 with double quantization for the frozen linear layers. Keep the vocabulary embedding, output head, norms, and other non-`Linear` tensors in the model compute dtype. This is the QLoRA-friendly recipe documented by [Transformers bitsandbytes integration](https://huggingface.co/docs/transformers/quantization/bitsandbytes). The HF implementation routes the block projections through ordinary `nn.Linear` calls, so bitsandbytes replaces them without the `train_temp` Cmix adapter-kernel rewrite.
@@ -54,7 +56,7 @@ DeepSpeed 0.19.7 is installed, but no DeepSpeed training/offload run has been co
 
 ## 6. Next admission sequence
 
-1. Save a BF16-base attention-only PEFT adapter, reload it, and compare logits/adapter outputs with the in-memory adapter.
+1. For the 13.3B checkpoint, save a BF16-base attention-only PEFT adapter, reload it, and compare logits/adapter outputs with the in-memory adapter. The equivalent short save/reload check passed for the 1.5B checkpoint.
 2. Measure real masked SFT forward/backward/AdamW steps at `B=1` with contexts up to 1,024 first, recording peak VRAM, host RSS, throughput, loss, and gradient finiteness. The 2,048-token result is too close to the 12 GiB limit for routine use, and 2,560 OOMed.
 3. Implement the HF `Rwkv7Cache` initial-state injection and compare tiny-model `B` gradients to the explicit WKV reference; only then profile the 13.3B base.
 4. Compare BF16 and NF4 gradients on identical batches. Add special-token rows and held-out quality checks after the adapter-only path is stable.

@@ -1,0 +1,27 @@
+{
+  "added_tokens_decoder": {
+    "0": {
+      "content": "<|endoftext|>",
+      "lstrip": false,
+      "normalized": false,
+      "rstrip": false,
+      "single_word": false,
+      "special": true
+    }
+  },
+  "auto_map": {
+    "AutoTokenizer": [
+      "tokenization_rwkv7.Rwkv7Tokenizer",
+      null
+    ]
+  },
+  "backend": "rwkv_world_trie",
+  "eos_token": "<|endoftext|>",
+  "is_local": true,
+  "local_files_only": true,
+  "model_max_length": 1000000000000000019884624838656,
+  "pad_token": "<|endoftext|>",
+  "padding_side": "left",
+  "tokenizer_class": "Rwkv7Tokenizer",
+  "unk_token": "<|endoftext|>"
+}

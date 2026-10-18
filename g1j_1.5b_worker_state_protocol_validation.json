@@ -1,0 +1,67 @@
+{
+  "model": {
+    "repo": "RWKV/RWKV7-G1j-1.5B-20260831",
+    "revision": "2c18b29ab7fbece25ff6112281eea0fa41fcb30f",
+    "path": "/workspace/RWKV7-G1j-1.5B-20260831",
+    "dtype": "BF16 frozen base; FP32 trainable parameters/state",
+    "layers": 24,
+    "hidden_size": 2048,
+    "heads": 32,
+    "head_dim": 64,
+    "training_context": 16384
+  },
+  "software": {
+    "torch": "2.14.1+cu126",
+    "torch_cuda": "12.6",
+    "transformers": "5.20.1",
+    "peft": "0.21.2"
+  },
+  "worker_gradient_protocol": {
+    "dataset_repo": "trl-lib/Capybara",
+    "dataset_revision": "e235e846458bff3398a88aed812347f7f0756520",
+    "row_indices": [
+      1,
+      16
+    ],
+    "unit_count": 2,
+    "loss_tokens": 48,
+    "worker_vs_padded_batch_loss_sum_relative_error": 0.00045578499966965634,
+    "attention_only_lora_target_count": 96,
+    "trainable_parameters": 3145728,
+    "fp32_gradient_payload_mib": 12.0,
+    "per_unit_loss_sum_reported": true,
+    "worker_vs_padded_batch_gradient_cosine": 0.9986206293106079,
+    "worker_vs_padded_batch_gradient_relative_l2_error": 0.05585099217694988,
+    "gradient_cosine_canary_threshold": 0.99,
+    "gradient_relative_l2_threshold": 0.1,
+    "gradient_canary_passed": true,
+    "worker_vs_padded_batch_coordinator_adamw_max_parameter_diff": 0.00019999945652671158,
+    "worker_vs_padded_batch_coordinator_adamw_mean_tensor_max_diff": 9.999841480142398e-05,
+    "strict_optimizer_update_parity_claimed": false,
+    "optimizer_update_difference_requires_followup": true,
+    "aggregation_passed": true
+  },
+  "state_tuning_protocol": {
+    "rank": 8,
+    "trainable_B_parameter_count": 393216,
+    "fp32_B_payload_mib": 1.5,
+    "sequence_tokens": 13,
+    "loss_tokens": 6,
+    "initial_state_dtype": "float32",
+    "base_parameters_frozen": true,
+    "gradient_checkpointing": false,
+    "chunked_loss_sum": 8.035165786743164,
+    "eager_loss_sum": 7.9582624435424805,
+    "chunked_eager_loss_relative_error": 0.00966333339045444,
+    "chunked_eager_B_gradient_cosine": 0.9986438751220703,
+    "chunked_eager_B_gradient_relative_l2_error": 0.05612751096487045,
+    "finite_nonzero_B_gradient": true,
+    "optimizer_step_changed_B": true,
+    "saved_one_step_state_adapter": "/workspace/dist_train_rwkv/artifacts/g1j_1.5b_state_tuning_protocol/state_adapter.safetensors",
+    "parity_passed": true
+  },
+  "cuda_peak_allocated_gib": 3.824,
+  "cuda_peak_reserved_gib": 3.904,
+  "cuda_free_gib_after_test": 8.125,
+  "elapsed_seconds": 10.873
+}

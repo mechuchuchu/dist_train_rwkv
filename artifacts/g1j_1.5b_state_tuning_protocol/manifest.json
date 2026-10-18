@@ -1,0 +1,11 @@
+{
+  "model_repo": "RWKV/RWKV7-G1j-1.5B-20260831",
+  "model_revision": "2c18b29ab7fbece25ff6112281eea0fa41fcb30f",
+  "rank": 8,
+  "basis_seed": 20261018,
+  "tensor": "B[layer,head,rank,head_dim]",
+  "dtype": "float32",
+  "optimizer": "AdamW(lr=1e-4,weight_decay=0)",
+  "steps": 1,
+  "validation_artifact_only": true
+}
