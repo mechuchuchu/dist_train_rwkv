@@ -10,9 +10,11 @@ import time
 import uuid
 from collections import deque
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 import torch
+from safetensors import safe_open
 from safetensors.torch import load as load_safetensors
 from safetensors.torch import save as save_safetensors
 
@@ -65,6 +67,73 @@ def encode_tensors(tensors: dict[str, torch.Tensor]) -> bytes:
 
 def decode_tensors(payload: bytes) -> dict[str, torch.Tensor]:
     return load_safetensors(payload)
+
+
+@dataclass(frozen=True)
+class PayloadFile:
+    """A gradient upload that was streamed to disk instead of held in memory.
+
+    `sha256` is the hash of the file's bytes, computed while it was received.
+    submit_result() reads tensors from it one at a time, so a coordinator's
+    memory does not grow with the size of an upload or with how many arrive at once.
+    """
+
+    path: Path
+    sha256: str
+    size: int
+
+
+class _BytesTensors:
+    """Tensors of an in-memory safetensors payload."""
+
+    def __init__(self, payload: bytes):
+        self._tensors = decode_tensors(payload)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc_info):
+        self._tensors = {}
+
+    def names(self) -> set[str]:
+        return set(self._tensors)
+
+    def shape(self, name: str) -> tuple[int, ...]:
+        return tuple(self._tensors[name].shape)
+
+    def tensor(self, name: str) -> torch.Tensor:
+        return self._tensors[name]
+
+
+class _FileTensors:
+    """Tensors of a safetensors file, read one at a time through a memory map."""
+
+    def __init__(self, path: Path):
+        self._file = safe_open(str(path), framework="pt", device="cpu")
+
+    def __enter__(self):
+        self._file.__enter__()
+        return self
+
+    def __exit__(self, *exc_info):
+        return self._file.__exit__(*exc_info)
+
+    def names(self) -> set[str]:
+        return set(self._file.keys())
+
+    def shape(self, name: str) -> tuple[int, ...]:
+        return tuple(self._file.get_slice(name).get_shape())
+
+    def tensor(self, name: str) -> torch.Tensor:
+        return self._file.get_tensor(name)
+
+
+def open_gradient_payload(payload: "bytes | PayloadFile"):
+    return _FileTensors(payload.path) if isinstance(payload, PayloadFile) else _BytesTensors(payload)
+
+
+def payload_sha256(payload: "bytes | PayloadFile") -> str:
+    return payload.sha256 if isinstance(payload, PayloadFile) else sha256_bytes(payload)
 
 
 OPTIMIZER_STATE_KEYS = ("exp_avg", "exp_avg_sq", "step")
@@ -235,6 +304,11 @@ class RoundCoordinator:
         self.unit_status = {unit_id: "pending" for unit_id in self.units}
         self.leases: dict[str, Lease] = {}
         self.accepted: dict[str, dict[str, Any]] = {}
+        # Running sum of the accepted units' gradients, added in acceptance order.
+        # Kept instead of the individual gradients, so memory does not grow with
+        # the number of units in a step.
+        self.grad_sums: dict[str, torch.Tensor] | None = None
+        self._snapshot_cache: tuple[int, bytes] | None = None
         self.loss_tokens = 0
         self.loss_sum = 0.0
         self.closed = False
@@ -306,6 +380,7 @@ class RoundCoordinator:
             self.unit_status = {unit_id: "pending" for unit_id in next_units}
             self.leases = {}
             self.accepted = {}
+            self.grad_sums = None
             self.loss_tokens = 0
             self.loss_sum = 0.0
             self.target_loss_tokens = int(target_loss_tokens)
@@ -350,9 +425,17 @@ class RoundCoordinator:
                 "close_metrics": self.close_metrics,
             }
 
+    def _encoded_theta(self) -> bytes:
+        """The adapter as safetensors bytes, encoded once per theta version."""
+        cache = self._snapshot_cache
+        if cache is None or cache[0] != self.theta_version:
+            cache = (self.theta_version, encode_tensors(self.theta))
+            self._snapshot_cache = cache
+        return cache[1]
+
     def snapshot_bytes(self) -> bytes:
         with self.lock:
-            return encode_tensors(self.theta)
+            return self._encoded_theta()
 
     def hyperparameters(self) -> dict[str, Any]:
         with self.lock:
@@ -379,7 +462,7 @@ class RoundCoordinator:
         hash of another.
         """
         with self.lock:
-            return encode_tensors(self.theta), self.theta_hash, self.theta_version
+            return self._encoded_theta(), self.theta_hash, self.theta_version
 
     def signal_training_complete(self, reason: str = "training_finished") -> dict[str, Any]:
         with self.lock:
@@ -510,7 +593,7 @@ class RoundCoordinator:
                             "worker_id": lease.worker_id, "message": message})
         raise ProtocolError(code, message, status)
 
-    def submit_result(self, metadata: dict[str, Any], payload: bytes) -> dict[str, Any]:
+    def submit_result(self, metadata: dict[str, Any], payload: "bytes | PayloadFile") -> dict[str, Any]:
         with self.lock:
             unit_id = str(metadata.get("unit_id", ""))
             if unit_id in self.accepted:
@@ -539,7 +622,7 @@ class RoundCoordinator:
                 self._reject_and_requeue(lease, "stale_theta", "result theta hash is stale")
             if str(metadata.get("worker_code_sha256", "")) != self.worker_code_sha256:
                 self._reject_and_requeue(lease, "worker_code_mismatch", "worker code hash differs", 403)
-            if sha256_bytes(payload) != str(metadata.get("gradient_sha256", "")):
+            if payload_sha256(payload) != str(metadata.get("gradient_sha256", "")):
                 self._reject_and_requeue(lease, "gradient_hash_mismatch", "gradient payload hash differs")
             unit = self.units[unit_id]
             if str(metadata.get("unit_sha256", "")) != str(unit["unit_sha256"]):
@@ -551,23 +634,39 @@ class RoundCoordinator:
             if not math.isfinite(loss_sum) or loss_sum < 0:
                 self._reject_and_requeue(lease, "invalid_loss", "loss_sum must be finite and nonnegative")
             try:
-                gradients = decode_tensors(payload)
+                source = open_gradient_payload(payload)
             except Exception as exc:
                 self._reject_and_requeue(lease, "invalid_payload", f"cannot decode safetensors: {exc}")
-            if set(gradients) != set(self.expected):
-                self._reject_and_requeue(lease, "gradient_names", "gradient tensor names differ from schema")
-            squared_norm = 0.0
-            for name, expected_shape in self.expected.items():
-                grad = gradients[name]
-                if tuple(grad.shape) != expected_shape:
-                    self._reject_and_requeue(lease, "gradient_shape", f"wrong shape for {name}")
-                grad = grad.to(device="cpu", dtype=torch.float32).contiguous()
-                if not torch.isfinite(grad).all().item():
-                    self._reject_and_requeue(lease, "nonfinite_gradient", f"non-finite gradient {name}")
-                gradients[name] = grad
-                squared_norm += float(torch.sum(grad * grad).item())
-            if not math.isfinite(squared_norm):
-                self._reject_and_requeue(lease, "invalid_gradient_norm", "gradient norm is not finite")
+            with source:
+                try:
+                    names = source.names()
+                except Exception as exc:
+                    self._reject_and_requeue(lease, "invalid_payload", f"cannot decode safetensors: {exc}")
+                if names != set(self.expected):
+                    self._reject_and_requeue(lease, "gradient_names", "gradient tensor names differ from schema")
+                # Validate every tensor before adding any, so a bad one cannot leave
+                # a half-added unit in the running sum.
+                squared_norm = 0.0
+                for name, expected_shape in self.expected.items():
+                    try:
+                        shape = source.shape(name)
+                        grad = source.tensor(name) if shape == expected_shape else None
+                    except Exception as exc:
+                        self._reject_and_requeue(lease, "invalid_payload", f"cannot decode safetensors: {exc}")
+                    if grad is None:
+                        self._reject_and_requeue(lease, "gradient_shape", f"wrong shape for {name}")
+                    grad = grad.to(device="cpu", dtype=torch.float32).contiguous()
+                    if not torch.isfinite(grad).all().item():
+                        self._reject_and_requeue(lease, "nonfinite_gradient", f"non-finite gradient {name}")
+                    squared_norm += float(torch.sum(grad * grad).item())
+                if not math.isfinite(squared_norm):
+                    self._reject_and_requeue(lease, "invalid_gradient_norm", "gradient norm is not finite")
+                if self.grad_sums is None:
+                    self.grad_sums = {name: torch.zeros_like(value) for name, value in self.theta.items()}
+                for name in self.expected:
+                    self.grad_sums[name].add_(
+                        source.tensor(name).to(device="cpu", dtype=torch.float32).contiguous()
+                    )
 
             self.leases.pop(lease_id, None)
             self.unit_status[unit_id] = "done"
@@ -582,13 +681,12 @@ class RoundCoordinator:
                 "loss_sum": loss_sum,
                 "gradient_sha256": metadata["gradient_sha256"],
                 "gradient_norm": math.sqrt(squared_norm),
-                "gradients": gradients,
                 "accepted_at": now,
             }
             self.accepted[unit_id] = result
             self.loss_tokens += loss_tokens
             self.loss_sum += loss_sum
-            self.events.append({k: v for k, v in result.items() if k != "gradients"} | {"event": "result_accepted"})
+            self.events.append(dict(result) | {"event": "result_accepted"})
             closed = False
             if self.loss_tokens >= self.target_loss_tokens and len(self.accepted) >= self.min_units:
                 self._close_round()
@@ -609,11 +707,11 @@ class RoundCoordinator:
             return
         if self.loss_tokens <= 0 or len(self.accepted) < self.min_units:
             raise ProtocolError("round_not_ready", "minimum units and loss tokens are required", 409)
-        grad_sums = {name: torch.zeros_like(value) for name, value in self.theta.items()}
-        for result in self.accepted.values():
-            for name, grad in result["gradients"].items():
-                grad_sums[name].add_(grad)
+        grad_sums, self.grad_sums = self.grad_sums, None
+        if grad_sums is None:
+            raise ProtocolError("round_not_ready", "no accepted gradients to apply", 409)
         mean_grads = {name: value / self.loss_tokens for name, value in grad_sums.items()}
+        del grad_sums
         norm = torch.linalg.vector_norm(torch.stack([g.norm() for g in mean_grads.values()])).item()
         if self.global_grad_clip is not None and norm > self.global_grad_clip:
             scale = self.global_grad_clip / max(norm, 1e-12)
@@ -623,6 +721,7 @@ class RoundCoordinator:
             parameter.grad = mean_grads[name]
         self.optimizer.step()
         self.theta = {name: parameter.detach().clone() for name, parameter in self.params.items()}
+        self._snapshot_cache = None
         old_hash = self.theta_hash
         self.theta_version += 1
         self.theta_hash = tensor_map_sha256(self.theta)

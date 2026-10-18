@@ -191,7 +191,7 @@ python g1j_dist_coordinator.py ... \
 | `--run-dir` | 산출물 폴더 |
 | `--manual-training-complete` | 마지막 round 후 `POST /training-complete` 대기 |
 | `--keep-checkpoints N` | 보관할 resume 체크포인트 수(기본 3) |
-| `--keep-gradient-rounds N` | 닫힌 round 중 unit별 gradient 파일을 보관할 개수. -1(기본)은 전부 보관. 파일 하나가 약 12 MiB입니다 |
+| `--keep-gradient-rounds N` | 닫힌 round 중 unit별 gradient 파일을 보관할 개수(기본 1: 직전 round만). -1은 전부 보관. 파일 하나는 adapter 크기(파라미터 × 4바이트)라서 1.5B는 12 MiB, 7.2B는 32 MiB입니다 |
 | `--resume`, `--resume-from-hf`, `--hf-run-id`, `--hf-version` | 위 resume 절 참고 |
 | `--push-adapter-to-hf`, `--hf-adapter-repo`, `--hf-adapter-public`, `--hf-push-every-steps`, `--hf-push-optimizer`, `--hf-token` | 위 Hub 절 참고 |
 
@@ -218,7 +218,8 @@ python g1j_dist_coordinator.py ... \
 | `ckpt/theta-NNNNNN/` | resume용 체크포인트 |
 | `coordinator_state.json` | 현재 round, 해시, 인정된 결과 요약, Hub push 상태 |
 | `round_log.jsonl` | 이벤트 로그(join, lease, 결과 인정/거부, round 종료, resume 등) |
-| `gradients/round-NNNNNN/` | 인정된 unit별 gradient (감사용. resume과 Hub push는 읽지 않습니다) |
+| `gradients/round-NNNNNN/` | 인정된 unit별 gradient (감사용. resume과 Hub push는 읽지 않습니다). `--keep-gradient-rounds`만큼만 남습니다 |
+| `incoming/` | 업로드 중인 `/result` 본문의 임시 파일. 처리가 끝나면 비워지고, 시작할 때도 비웁니다 |
 | `hub_push_queue/` | 아직 올라가지 않은 Hub push |
 | `hub_resume/` | `--resume-from-hf`로 내려받은 파일 |
 | `data_manifest.json` | 사용한 unit manifest 사본 |

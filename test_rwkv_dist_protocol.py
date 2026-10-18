@@ -1,12 +1,17 @@
 from __future__ import annotations
 
+import tempfile
 import threading
 import unittest
 import time
+from pathlib import Path
+from unittest.mock import patch
 
 import torch
 
+import rwkv_dist_protocol
 from rwkv_dist_protocol import (
+    PayloadFile,
     ProtocolError,
     RoundCoordinator,
     adamw_hyperparameters,
@@ -341,3 +346,172 @@ class OptimizerResumeTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class LeanAggregationTests(unittest.TestCase):
+    """Gradients are summed as they arrive and read from disk tensor by tensor."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.dir = Path(self.temp.name)
+
+    def make_coordinator(self) -> RoundCoordinator:
+        coordinator = RoundCoordinator(
+            theta={"lora_A": torch.tensor([0.5, -0.25]), "lora_B": torch.tensor([1.0])},
+            units=[make_unit("unit-0", 2), make_unit("unit-1", 6)],
+            run_id="lean", base={"revision": "pinned"}, tokenizer={"hash": "pinned"},
+            worker_code_sha256="worker-code", target_loss_tokens=8, min_units=2,
+            lease_seconds=30, learning_rate=1e-2,
+        )
+        coordinator.join("w0")
+        return coordinator
+
+    def payload_file(self, payload: bytes, name: str = "upload.part", *, sha256=None) -> PayloadFile:
+        path = self.dir / name
+        path.write_bytes(payload)
+        return PayloadFile(path=path, sha256=sha256 or sha256_bytes(payload), size=len(payload))
+
+    def gradients(self, a, b) -> dict:
+        return {"lora_A": torch.tensor(a), "lora_B": torch.tensor(b)}
+
+    def submit(self, coordinator, tensors_or_bytes, *, as_file=False, name="upload.part", sha256=None):
+        lease = coordinator.lease("w0")
+        payload = (tensors_or_bytes if isinstance(tensors_or_bytes, bytes)
+                   else encode_tensors(tensors_or_bytes))
+        metadata = make_metadata(lease, lease["unit"], payload)
+        sent = self.payload_file(payload, name, sha256=sha256) if as_file else payload
+        return coordinator.submit_result(metadata, sent)
+
+    def run_round(self, coordinator, *, as_file):
+        self.submit(coordinator, self.gradients([1.0, 2.0], [3.0]), as_file=as_file, name="a.part")
+        return self.submit(coordinator, self.gradients([0.5, -1.0], [2.0]), as_file=as_file, name="b.part")
+
+    def test_a_streamed_file_gives_exactly_the_update_the_same_bytes_give(self):
+        from_bytes, from_file = self.make_coordinator(), self.make_coordinator()
+        self.assertTrue(self.run_round(from_bytes, as_file=False)["round_closed"])
+        self.assertTrue(self.run_round(from_file, as_file=True)["round_closed"])
+        self.assertEqual(from_file.theta_hash, from_bytes.theta_hash)
+        theta_a, moments_a, _, _ = from_file.export_state()
+        theta_b, moments_b, _, _ = from_bytes.export_state()
+        for name in theta_b:
+            self.assertTrue(torch.equal(theta_a[name], theta_b[name]))
+        for name in moments_b:
+            self.assertTrue(torch.equal(moments_a[name], moments_b[name]))
+
+    def test_the_update_is_adamw_on_the_token_normalised_sum(self):
+        coordinator = self.make_coordinator()
+        self.run_round(coordinator, as_file=True)
+        parameters = {"lora_A": torch.nn.Parameter(torch.tensor([0.5, -0.25])),
+                      "lora_B": torch.nn.Parameter(torch.tensor([1.0]))}
+        optimizer = torch.optim.AdamW(list(parameters.values()), lr=1e-2, weight_decay=0.0)
+        parameters["lora_A"].grad = torch.tensor([1.5, 1.0]) / 8
+        parameters["lora_B"].grad = torch.tensor([5.0]) / 8
+        optimizer.step()
+        for name, parameter in parameters.items():
+            self.assertTrue(torch.equal(coordinator.theta[name], parameter.detach()), name)
+
+    def test_individual_gradients_are_not_kept_only_their_running_sum(self):
+        coordinator = self.make_coordinator()
+        first = self.submit(coordinator, self.gradients([1.0, 2.0], [3.0]), as_file=True, name="a.part")
+        self.assertFalse(first["round_closed"])
+        for result in coordinator.accepted.values():
+            self.assertFalse(any(isinstance(value, (torch.Tensor, dict)) for value in result.values()))
+        self.assertTrue(torch.equal(coordinator.grad_sums["lora_A"], torch.tensor([1.0, 2.0])))
+        self.submit(coordinator, self.gradients([0.5, -1.0], [2.0]), as_file=True, name="b.part")
+        self.assertIsNone(coordinator.grad_sums)  # applied and released when the round closed
+
+    def test_a_new_round_starts_from_an_empty_sum(self):
+        coordinator = self.make_coordinator()
+        self.run_round(coordinator, as_file=True)
+        coordinator.start_next_round([make_unit("next-0", 2)], target_loss_tokens=2, min_units=1)
+        self.assertIsNone(coordinator.grad_sums)
+        coordinator.join("w0")
+        self.submit(coordinator, self.gradients([4.0, 4.0], [4.0]), as_file=True, name="c.part")
+        self.assertEqual(coordinator.theta_version, 2)
+
+        # The second step must see only its own gradient, with Adam's moments carried over.
+        parameters = {"lora_A": torch.nn.Parameter(torch.tensor([0.5, -0.25])),
+                      "lora_B": torch.nn.Parameter(torch.tensor([1.0]))}
+        optimizer = torch.optim.AdamW(list(parameters.values()), lr=1e-2, weight_decay=0.0)
+        for a, b, tokens in (([1.5, 1.0], [5.0], 8), ([4.0, 4.0], [4.0], 2)):
+            parameters["lora_A"].grad = torch.tensor(a) / tokens
+            parameters["lora_B"].grad = torch.tensor(b) / tokens
+            optimizer.step()
+        for name, parameter in parameters.items():
+            self.assertTrue(torch.equal(coordinator.theta[name], parameter.detach()), name)
+
+    def test_a_file_payload_is_never_decoded_into_memory_as_a_whole(self):
+        coordinator = self.make_coordinator()
+        with patch.object(rwkv_dist_protocol, "decode_tensors", side_effect=AssertionError("read whole")):
+            result = self.submit(coordinator, self.gradients([1.0, 2.0], [3.0]), as_file=True)
+        self.assertEqual(result["status"], "accepted")
+
+    def test_the_hash_computed_while_receiving_is_the_one_compared(self):
+        coordinator = self.make_coordinator()
+        with self.assertRaises(ProtocolError) as caught:
+            self.submit(coordinator, self.gradients([1.0, 2.0], [3.0]), as_file=True, sha256="0" * 64)
+        self.assertEqual(caught.exception.code, "gradient_hash_mismatch")
+        self.assertEqual(coordinator.unit_status["unit-0"], "pending")
+
+    def rejected(self, coordinator, payload: bytes) -> str:
+        with self.assertRaises(ProtocolError) as caught:
+            self.submit(coordinator, payload, as_file=True, name="bad.part")
+        return caught.exception.code
+
+    def test_every_kind_of_bad_file_is_rejected_requeued_and_leaves_the_sum_alone(self):
+        for label, payload, code in [
+            ("not safetensors", b"definitely not a safetensors file", "invalid_payload"),
+            ("truncated", encode_tensors(self.gradients([1.0, 2.0], [3.0]))[:-3], "invalid_payload"),
+            ("missing tensor", encode_tensors({"lora_A": torch.ones(2)}), "gradient_names"),
+            ("extra tensor", encode_tensors(self.gradients([1.0, 2.0], [3.0]) | {"extra": torch.ones(1)}),
+             "gradient_names"),
+            ("wrong shape", encode_tensors({"lora_A": torch.ones(3), "lora_B": torch.ones(1)}),
+             "gradient_shape"),
+            ("nan in the second tensor", encode_tensors(self.gradients([1.0, 2.0], [float("nan")])),
+             "nonfinite_gradient"),
+            ("inf in the first tensor", encode_tensors(self.gradients([float("inf"), 2.0], [3.0])),
+             "nonfinite_gradient"),
+        ]:
+            with self.subTest(label):
+                coordinator = self.make_coordinator()
+                self.submit(coordinator, self.gradients([10.0, 20.0], [30.0]), as_file=True, name="good.part")
+                before = {k: v.clone() for k, v in coordinator.grad_sums.items()}
+                self.assertEqual(self.rejected(coordinator, payload), code)
+                # A tensor that fails late must not leave an earlier one half-added.
+                for name, value in before.items():
+                    self.assertTrue(torch.equal(coordinator.grad_sums[name], value), name)
+                self.assertEqual(coordinator.loss_tokens, 2)
+                self.assertEqual(len(coordinator.accepted), 1)
+                self.assertEqual(coordinator.unit_status["unit-1"], "pending")
+                # and the unit can be done properly afterwards
+                final = self.submit(coordinator, self.gradients([0.5, -1.0], [2.0]),
+                                    as_file=True, name="retry.part")
+                self.assertTrue(final["round_closed"])
+
+    def test_a_low_precision_gradient_file_is_summed_in_float32(self):
+        coordinator = self.make_coordinator()
+        half = {"lora_A": torch.tensor([1.5, 2.5], dtype=torch.bfloat16),
+                "lora_B": torch.tensor([3.0], dtype=torch.bfloat16)}
+        self.submit(coordinator, half, as_file=True)
+        self.assertEqual(coordinator.grad_sums["lora_A"].dtype, torch.float32)
+        self.assertTrue(torch.equal(coordinator.grad_sums["lora_A"], torch.tensor([1.5, 2.5])))
+
+    def test_the_snapshot_is_encoded_once_per_adapter_version(self):
+        coordinator = self.make_coordinator()
+        real = rwkv_dist_protocol.encode_tensors
+        with patch.object(rwkv_dist_protocol, "encode_tensors", wraps=real) as encode:
+            first = coordinator.snapshot()
+            again = coordinator.snapshot()
+            self.assertIs(again[0], first[0])
+            self.assertIs(coordinator.snapshot_bytes(), first[0])
+            self.assertEqual(encode.call_count, 1)
+            self.run_round(coordinator, as_file=True)  # the adapter advances
+            encode.reset_mock()
+            after = coordinator.snapshot()
+            coordinator.snapshot()
+            self.assertEqual(encode.call_count, 1)
+        self.assertIsNot(after[0], first[0])
+        self.assertEqual(after[2], 1)
+        self.assertEqual(after[1], tensor_map_sha256(decode_tensors(after[0])))
+        self.assertEqual(first[1], tensor_map_sha256(decode_tensors(first[0])))

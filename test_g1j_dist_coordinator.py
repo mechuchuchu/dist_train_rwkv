@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import io
 import json
 import base64
 import tempfile
@@ -15,6 +16,8 @@ import torch
 
 import shutil
 from safetensors.torch import load_file, save_file
+
+import g1j_dist_coordinator as coordinator_module
 
 from g1j_dist_coordinator import (
     Application,
@@ -33,6 +36,8 @@ from rwkv_dist_checkpoint import (
 )
 from test_rwkv_hub import FakeHub
 from rwkv_dist_protocol import (
+    PayloadFile,
+    ProtocolError,
     RoundCoordinator,
     decode_tensors,
     encode_tensors,
@@ -362,6 +367,12 @@ def gradient_for(unit_id: str, theta: dict[str, torch.Tensor]) -> dict[str, torc
     }
 
 
+def logged_events(app: Application, name: str) -> list[dict]:
+    """Events of one kind from round_log.jsonl (they leave memory once written)."""
+    lines = (app.run_dir / "round_log.jsonl").read_text().splitlines()
+    return [event for event in map(json.loads, lines) if event["event"] == name]
+
+
 def open_run(root: Path, *, loaded=None, learning_rate: float = 0.05, plan=None,
              manifest=None, keep: int = 3, **app_kwargs) -> Application:
     """Start a coordinator the way main() does: fresh, or resumed from `loaded`."""
@@ -415,7 +426,7 @@ class Served:
         with urlopen(request, timeout=5) as response:
             return json.loads(response.read())
 
-    def post_result(self, worker_id: str, lease: dict) -> tuple[int, dict]:
+    def post_result(self, worker_id: str, lease: dict, **metadata_overrides) -> tuple[int, dict]:
         coordinator = self.app.coordinator
         unit = lease["unit"]
         payload = encode_tensors(gradient_for(unit["unit_id"], coordinator.theta))
@@ -427,7 +438,7 @@ class Served:
             "worker_code_sha256": coordinator.worker_code_sha256,
             "loss_tokens": unit["loss_tokens"], "loss_sum": 1.0,
             "gradient_sha256": sha256_bytes(payload),
-        }
+        } | metadata_overrides
         request = Request(
             self.base_url + "/result", data=payload, method="POST",
             headers={
@@ -595,7 +606,7 @@ class CoordinatorResumeTests(unittest.TestCase):
         self.assertEqual(loaded.state["theta_version"], 2)
         resumed = open_run(self.root / "run-a", loaded=loaded)
         self.assertEqual((resumed.coordinator.round_id, resumed.round_index), (3, 2))
-        events = [e for e in resumed.coordinator.events if e["event"] == "coordinator_resumed"]
+        events = logged_events(resumed, "coordinator_resumed")
         self.assertEqual(len(events[0]["skipped_checkpoints"]), 1)
 
     def test_a_checkpoint_from_a_different_configuration_is_refused(self):
@@ -717,7 +728,7 @@ class CoordinatorHubResumeTests(unittest.TestCase):
         self.assertEqual(loaded.optimizer_tensors, {})
         self.assertEqual(loaded.state["theta_version"], 1)
         restored = self.finish_from(loaded)
-        resumed_event = [e for e in restored.coordinator.events if e["event"] == "coordinator_resumed"][0]
+        resumed_event = logged_events(restored, "coordinator_resumed")[0]
         self.assertFalse(resumed_event["optimizer_restored"])
         self.assertEqual(restored.coordinator.theta_version, reference.coordinator.theta_version)
         self.assertNotEqual(restored.coordinator.theta_hash, reference.coordinator.theta_hash)
@@ -806,14 +817,23 @@ class GradientRetentionTests(unittest.TestCase):
     def files_in(self, name: str, round_dir: str) -> int:
         return len(list((self.root / name / "run" / "gradients" / round_dir).glob("*.safetensors")))
 
-    def test_gradients_are_stored_per_round_and_kept_by_default(self):
-        app = open_run(self.root / "all")
+    def test_gradients_are_stored_per_round_and_everything_is_kept_on_request(self):
+        app = open_run(self.root / "all", keep_gradient_rounds=-1)
         with Served(app) as served:
             served.finish()
         self.assertEqual(gradient_dirs(self.root / "all"),
                          ["round-000001", "round-000002", "round-000003"])
         for round_dir in gradient_dirs(self.root / "all"):
             self.assertEqual(self.files_in("all", round_dir), 2)
+
+    def test_by_default_only_the_latest_round_s_gradients_are_kept(self):
+        # Every file is as large as the adapter, so keeping all of them would fill
+        # a small coordinator's disk; the default is the newest round only.
+        app = open_run(self.root / "default")
+        with Served(app) as served:
+            served.finish()
+        self.assertEqual(gradient_dirs(self.root / "default"), ["round-000003"])
+        self.assertEqual(self.files_in("default", "round-000003"), 2)
 
     def test_closed_rounds_beyond_the_retention_count_are_deleted(self):
         app = open_run(self.root / "keep1", keep_gradient_rounds=1)
@@ -1111,3 +1131,138 @@ class HubPushRecoveryTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class RecordingReader(io.BytesIO):
+    """A request body that remembers how much was asked for at a time."""
+
+    def __init__(self, data: bytes):
+        super().__init__(data)
+        self.requests: list[int] = []
+
+    def read(self, size=-1):
+        self.requests.append(size)
+        return super().read(size)
+
+
+class LeanCoordinatorTests(unittest.TestCase):
+    """Uploads go to disk, not memory, and the event log leaves memory once written."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+
+    def incoming(self, app: Application) -> list[str]:
+        return sorted(path.name for path in app.incoming_dir.iterdir())
+
+    def test_an_upload_is_copied_in_bounded_chunks_and_hashed_on_the_way(self):
+        app = open_run(self.root / "chunks")
+        data = bytes(range(256)) * 22  # 5632 bytes
+        reader = RecordingReader(data)
+        with patch.object(coordinator_module, "UPLOAD_CHUNK_BYTES", 1000):
+            upload = app.stream_upload(reader, len(data))
+        self.assertLessEqual(max(reader.requests), 1000)
+        self.assertGreater(len(reader.requests), 5)
+        self.assertEqual(upload.sha256, sha256_bytes(data))
+        self.assertEqual(upload.size, len(data))
+        self.assertEqual(upload.path.read_bytes(), data)
+        self.assertEqual(upload.path.parent, app.incoming_dir)
+
+    def test_a_body_that_ends_early_is_an_error_and_leaves_nothing_behind(self):
+        app = open_run(self.root / "short")
+        with self.assertRaises(ProtocolError) as caught:
+            app.stream_upload(io.BytesIO(b"x" * 100), 5000)
+        self.assertEqual(caught.exception.code, "truncated_payload")
+        self.assertEqual(self.incoming(app), [])
+
+    def test_a_read_error_mid_upload_leaves_nothing_behind(self):
+        app = open_run(self.root / "broken")
+
+        class Breaks:
+            calls = 0
+
+            def read(self, size):
+                self.calls += 1
+                if self.calls > 1:
+                    raise ConnectionResetError("client went away")
+                return b"x" * size
+
+        with patch.object(coordinator_module, "UPLOAD_CHUNK_BYTES", 10):
+            with self.assertRaises(ConnectionResetError):
+                app.stream_upload(Breaks(), 100)
+        self.assertEqual(self.incoming(app), [])
+
+    def test_an_accepted_upload_is_moved_into_its_round_folder(self):
+        app = open_run(self.root / "accepted")
+        with Served(app) as served:
+            results = served.work("w", max_units=1)
+        self.assertEqual(results[0][0], 200)
+        self.assertEqual(self.incoming(app), [])
+        [stored] = list((app.run_dir / "gradients" / "round-000001").glob("*.safetensors"))
+        accepted = logged_events(app, "result_accepted")[-1]
+        self.assertEqual(sha256_bytes(stored.read_bytes()), accepted["gradient_sha256"])
+        self.assertEqual(list((app.run_dir / "gradients" / "round-000001").glob("*.tmp")), [])
+
+    def test_a_rejected_upload_leaves_no_file_anywhere(self):
+        app = open_run(self.root / "rejected")
+        with Served(app) as served:
+            served.get_json("/join?worker_id=w")
+            lease = served.get_json("/lease?worker_id=w")
+            status, body = served.post_result("w", lease, gradient_sha256="0" * 64)
+        self.assertEqual((status, body["error"]), (409, "gradient_hash_mismatch"))
+        self.assertEqual(self.incoming(app), [])
+        self.assertEqual(list((app.run_dir / "gradients").rglob("*.safetensors")), [])
+
+    def test_a_lost_lease_upload_is_discarded_without_leaving_a_file(self):
+        app = open_run(self.root / "late")
+        with Served(app) as served:
+            served.get_json("/join?worker_id=w")
+            lease = served.get_json("/lease?worker_id=w")
+            served.get_json("/lease?worker_id=w")  # a second unit for the same worker
+            status, body = served.post_result("w", lease, lease_id="no-such-lease")
+        self.assertEqual((status, body["error"]), (409, "unknown_lease"))
+        self.assertEqual(self.incoming(app), [])
+
+    def test_uploads_left_by_a_crashed_process_are_cleared_at_startup(self):
+        stale = self.root / "restart" / "run" / "incoming"
+        stale.mkdir(parents=True)
+        (stale / "half-received.part").write_bytes(b"x" * 1000)
+        app = open_run(self.root / "restart")
+        self.assertEqual(self.incoming(app), [])
+
+    def test_events_leave_memory_once_written_and_none_are_lost_or_repeated(self):
+        app = open_run(self.root / "events")
+        log = app.run_dir / "round_log.jsonl"
+        written = len(log.read_text().splitlines()) if log.exists() else 0
+        self.assertEqual(app.coordinator.events, [])
+        for batch in range(3):
+            for index in range(4):
+                app.coordinator.events.append({"event": "probe", "batch": batch, "index": index})
+            app.persist_events()
+            self.assertEqual(app.coordinator.events, [])
+            app.persist_events()  # nothing new: must not repeat anything
+        probes = [event for event in map(json.loads, log.read_text().splitlines())
+                  if event["event"] == "probe"]
+        self.assertEqual([(e["batch"], e["index"]) for e in probes],
+                         [(b, i) for b in range(3) for i in range(4)])
+        self.assertEqual(len(log.read_text().splitlines()), written + 12)
+
+    def test_an_event_added_while_persisting_is_kept_for_the_next_write(self):
+        app = open_run(self.root / "race")
+        app.coordinator.events.append({"event": "probe", "n": 1})
+        real_dumps = json.dumps
+        injected = []
+
+        def dumps_and_append(*args, **kwargs):
+            if not injected:  # a heartbeat arrives in the middle of the write
+                injected.append(True)
+                app.coordinator.events.append({"event": "probe", "n": 2})
+            return real_dumps(*args, **kwargs)
+
+        with patch.object(coordinator_module.json, "dumps", dumps_and_append):
+            app.persist_events()
+        app.persist_events()
+        probes = [e["n"] for e in map(json.loads, (app.run_dir / "round_log.jsonl").read_text().splitlines())
+                  if e["event"] == "probe"]
+        self.assertEqual(probes, [1, 2])

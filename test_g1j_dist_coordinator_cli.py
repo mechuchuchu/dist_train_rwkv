@@ -294,6 +294,8 @@ class CoordinatorCommandLineTests(unittest.TestCase):
         status, _ = self.run_main(self.root / "ok", "--keep-gradient-rounds", "2")
         self.assertEqual(status["keep_gradient_rounds"], 2)
         status, _ = self.run_main(self.root / "default")
+        self.assertEqual(status["keep_gradient_rounds"], 1)
+        status, _ = self.run_main(self.root / "all", "--keep-gradient-rounds", "-1")
         self.assertEqual(status["keep_gradient_rounds"], -1)
 
     def test_unknown_optimizer_policy_is_rejected_by_the_parser(self):

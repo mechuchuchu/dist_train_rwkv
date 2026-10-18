@@ -13,6 +13,7 @@ import re
 import shutil
 import threading
 import time
+import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
@@ -31,6 +32,7 @@ from rwkv_dist_checkpoint import (
     write_checkpoint,
 )
 from rwkv_dist_protocol import (
+    PayloadFile,
     ProtocolError,
     RoundCoordinator,
     adamw_hyperparameters,
@@ -57,6 +59,8 @@ from rwkv_hub import (
 MODEL_ID = "RWKV/RWKV7-G1j-1.5B-20260831"
 MODEL_REVISION = "2c18b29ab7fbece25ff6112281eea0fa41fcb30f"
 MODEL_PATH = Path("/workspace/RWKV7-G1j-1.5B-20260831")
+UPLOAD_CHUNK_BYTES = 1024 * 1024
+
 # Where a fresh run looks for its starting adapter; make_initial_adapter.py writes here.
 DEFAULT_INITIAL_ADAPTER_DIR = Path("artifacts/g1j_1.5b_lora_init")
 def worker_bundle_sha256(root: Path) -> str:
@@ -296,7 +300,7 @@ class Application:
                  start_round_index: int = 0,
                  checkpoint_keep: int = 3,
                  round_plan_sha256: str | None = None,
-                 keep_gradient_rounds: int = -1):
+                 keep_gradient_rounds: int = 1):
         self.coordinator = coordinator
         self.token = token
         self.run_dir = run_dir
@@ -318,6 +322,7 @@ class Application:
         self.round_index = start_round_index
         self.checkpoint_keep = int(checkpoint_keep)
         # Closed rounds whose per-unit gradient files are kept; -1 keeps all of them.
+        # Each file is as large as the adapter, so the default keeps only the latest.
         self.keep_gradient_rounds = int(keep_gradient_rounds)
         self.round_plan_sha256 = round_plan_sha256 or round_plan_digest(self.round_plan)
         self.hub_push_versions: dict[str, dict] = {}
@@ -331,6 +336,11 @@ class Application:
         self.event_cursor = 0
         self.run_dir.mkdir(parents=True, exist_ok=True)
         (self.run_dir / "gradients").mkdir(exist_ok=True)
+        # Uploads are streamed here before they are validated; anything left from
+        # a previous process belongs to a request that never finished.
+        self.incoming_dir = self.run_dir / "incoming"
+        shutil.rmtree(self.incoming_dir, ignore_errors=True)
+        self.incoming_dir.mkdir()
         shutil.copy2(adapter_config_dir / "adapter_config.json", self.run_dir / "adapter_config.json")
         (self.run_dir / "data_manifest.json").write_text(json.dumps(manifest, indent=2, ensure_ascii=False) + "\n")
         if self.hf_adapter_repo is not None:
@@ -341,27 +351,63 @@ class Application:
             self.hub_push_thread.start()
 
     def persist_events(self) -> None:
+        """Append new events to round_log.jsonl and drop them from memory.
+
+        Only the coordinator appends (at the end), so removing exactly the
+        written prefix is safe, and a long run does not accumulate every
+        heartbeat in RAM.
+        """
         with self.persist_lock:
             events = self.coordinator.events[self.event_cursor:]
             if events:
                 with (self.run_dir / "round_log.jsonl").open("a") as f:
                     for event in events:
                         f.write(json.dumps(event, sort_keys=True, ensure_ascii=False) + "\n")
-                self.event_cursor = len(self.coordinator.events)
+                del self.coordinator.events[:self.event_cursor + len(events)]
+                self.event_cursor = 0
 
-    def persist_result_payload(self, unit_id: str, payload: bytes,
+    def stream_upload(self, source, size: int) -> PayloadFile:
+        """Copy `size` bytes from `source` to a file in incoming/, hashing as they pass.
+
+        Memory use is one chunk however large the upload is or however many
+        arrive at once. Raises ProtocolError (and leaves nothing behind) if the
+        body ends early.
+        """
+        path = self.incoming_dir / f"{uuid.uuid4().hex}.part"
+        digest = hashlib.sha256()
+        received = 0
+        try:
+            with path.open("wb") as handle:
+                while received < size:
+                    chunk = source.read(min(UPLOAD_CHUNK_BYTES, size - received))
+                    if not chunk:
+                        break
+                    handle.write(chunk)
+                    digest.update(chunk)
+                    received += len(chunk)
+            if received != size:
+                raise ProtocolError("truncated_payload", "request body shorter than Content-Length", 400)
+        except BaseException:
+            path.unlink(missing_ok=True)
+            raise
+        return PayloadFile(path=path, sha256=digest.hexdigest(), size=size)
+
+    def persist_result_payload(self, unit_id: str, payload: "bytes | PayloadFile",
                                round_id: int | None = None) -> None:
         """Store an accepted unit's gradient under ``gradients/round-NNNNNN/``.
 
         `round_id` is the round the result was accepted in. The handler passes it
         explicitly because the next round may already be open by the time a
-        slower request gets here.
+        slower request gets here. A streamed upload is moved into place, not copied.
         """
         round_id = self.coordinator.round_id if round_id is None else int(round_id)
         directory = self.run_dir / "gradients" / f"round-{round_id:06d}"
         directory.mkdir(parents=True, exist_ok=True)
         safe_name = hashlib.sha256(unit_id.encode()).hexdigest()
         path = directory / f"{safe_name}.safetensors"
+        if isinstance(payload, PayloadFile):
+            payload.path.replace(path)
+            return
         temp = path.with_suffix(".tmp")
         temp.write_bytes(payload)
         temp.replace(path)
@@ -908,17 +954,16 @@ def make_handler(app: Application):
             if route != "/result":
                 self._json(404, {"error": "not_found"})
                 return
+            upload = None
             try:
                 size = int(self.headers.get("Content-Length", "-1"))
                 if size < 1 or size > 128 * 1024 * 1024:
                     raise ProtocolError("invalid_payload_size", "payload size must be 1..128 MiB", 413)
                 encoded_metadata = self.headers.get("X-Result-Metadata", "")
                 metadata = json.loads(base64.urlsafe_b64decode(encoded_metadata.encode("ascii")))
-                payload = self.rfile.read(size)
-                if len(payload) != size:
-                    raise ProtocolError("truncated_payload", "request body shorter than Content-Length", 400)
-                result = app.coordinator.submit_result(metadata, payload)
-                app.persist_result_payload(str(metadata["unit_id"]), payload,
+                upload = app.stream_upload(self.rfile, size)
+                result = app.coordinator.submit_result(metadata, upload)
+                app.persist_result_payload(str(metadata["unit_id"]), upload,
                                            round_id=int(metadata["round_id"]))
                 if result["round_closed"]:
                     app.persist_checkpoint()
@@ -940,6 +985,9 @@ def make_handler(app: Application):
                 self._json(exc.status, {"error": exc.code, "message": str(exc)})
             except Exception as exc:
                 self._json(400, {"error": "bad_request", "message": str(exc)})
+            finally:
+                if upload is not None:
+                    upload.path.unlink(missing_ok=True)  # rejected uploads; accepted ones were moved
 
     return Handler
 
@@ -997,10 +1045,11 @@ def main() -> None:
                              "verifies. Work in flight in the interrupted round is discarded and "
                              "the round restarts; data, plan, model and optimizer settings must "
                              "match the original launch")
-    parser.add_argument("--keep-gradient-rounds", type=int, default=-1,
+    parser.add_argument("--keep-gradient-rounds", type=int, default=1,
                         help="closed rounds whose per-unit gradient files under gradients/ are kept "
                              "(the open round's always are); older ones are deleted. Each file is "
-                             "about 12 MiB. -1 keeps everything")
+                             "4 bytes x LoRA parameters (12 MiB for 1.5B, 32 MiB for 7.2B). "
+                             "-1 keeps everything (default: %(default)s)")
     parser.add_argument("--keep-checkpoints", type=int, default=3,
                         help="resume checkpoints to keep under <run-dir>/ckpt (newest first)")
     args = parser.parse_args()
