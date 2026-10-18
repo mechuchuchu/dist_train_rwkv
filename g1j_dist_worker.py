@@ -185,6 +185,10 @@ def main() -> None:
     run_id = descriptor["run_id"]
     if descriptor["base"]["repo"] != MODEL_ID or descriptor["base"]["revision"] != MODEL_REVISION:
         raise RuntimeError("coordinator base model identity does not match this worker")
+    if descriptor["worker_code_sha256"] != bundle_hash:
+        raise RuntimeError("worker bundle hash does not match coordinator's pinned code")
+    query = urllib.parse.urlencode({"worker_id": args.worker_id})
+    waiter.get_json(f"/join?{query}")
     model_path = ensure_hf_checkpoint(
         MODEL_ID, MODEL_REVISION, args.model_path,
         fetch_from_hf=args.fetch_model_from_hf,
@@ -195,8 +199,6 @@ def main() -> None:
     actual_model_hash = sha256_bytes(manifest_path.read_bytes())
     if descriptor["base"]["release_manifest_sha256"] != actual_model_hash:
         raise RuntimeError("local base weights do not match the coordinator's pinned manifest")
-    if descriptor["worker_code_sha256"] != bundle_hash:
-        raise RuntimeError("worker bundle hash does not match coordinator's pinned code")
     if descriptor["training_complete"]:
         print(json.dumps({"status": "training_complete", "run_id": run_id}), flush=True)
         return
@@ -206,7 +208,22 @@ def main() -> None:
     params = trainable_parameters(model)
     loaded_theta_hash = None
     processed = 0
+    last_waiting_round = None
     while args.max_units == 0 or processed < args.max_units:
+        join_status = waiter.get_json(f"/join?{query}")
+        if join_status["status"] == "training_complete":
+            print(json.dumps({"status": "training_complete", "run_id": run_id,
+                              "processed_units": processed}), flush=True)
+            break
+        if join_status["status"] == "waiting_next_round":
+            eligible_round = join_status["round_id"]
+            if last_waiting_round != eligible_round:
+                print(json.dumps({"status": "waiting_next_round",
+                                  "eligible_round_id": eligible_round}), flush=True)
+                last_waiting_round = eligible_round
+            time.sleep(args.poll_seconds)
+            continue
+        last_waiting_round = None
         descriptor = waiter.get_json("/round")
         if descriptor["run_id"] != run_id:
             raise RuntimeError(
@@ -219,7 +236,6 @@ def main() -> None:
         if descriptor["status"] == "closed":
             time.sleep(args.poll_seconds)
             continue
-        query = urllib.parse.urlencode({"worker_id": args.worker_id})
         lease_response = waiter.get_json(f"/lease?{query}")
         if lease_response["status"] == "training_complete":
             print(json.dumps({"status": "training_complete", "run_id": run_id,

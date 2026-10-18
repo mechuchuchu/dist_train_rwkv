@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Development coordinator for a single LoRA-SFT round over authenticated HTTP."""
+"""Development coordinator for multi-step LoRA-SFT over authenticated HTTP."""
 
 from __future__ import annotations
 
@@ -8,8 +8,8 @@ import base64
 import hashlib
 import json
 import os
+import queue
 import shutil
-import tempfile
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -28,6 +28,7 @@ from rwkv_dist_protocol import (
     parameter_name_to_peft_saved_name,
     sha256_bytes,
     tensor_map_sha256,
+    unit_digest,
 )
 from rwkv_dist_client import WORKER_BUNDLE_FILES
 from rwkv_hub import ensure_hf_checkpoint, push_adapter_snapshot
@@ -59,6 +60,34 @@ def read_manifest(path: Path) -> dict:
     return manifest
 
 
+def build_round_plan(
+    units: list[dict], *, epochs: int, units_per_step: int, min_units_per_step: int
+) -> list[dict]:
+    if epochs <= 0 or units_per_step < 0 or min_units_per_step <= 0:
+        raise ValueError("epochs and min_units_per_step must be positive; units_per_step cannot be negative")
+    plan = []
+    for epoch in range(1, epochs + 1):
+        epoch_units = []
+        for source in units:
+            unit = dict(source)
+            unit["unit_id"] = f"epoch-{epoch:04d}/{source['unit_id']}"
+            unit.pop("unit_sha256", None)
+            unit["unit_sha256"] = unit_digest(unit)
+            epoch_units.append(unit)
+        chunk_size = units_per_step or len(epoch_units)
+        for offset in range(0, len(epoch_units), chunk_size):
+            step_units = epoch_units[offset:offset + chunk_size]
+            plan.append({
+                "units": step_units,
+                "target_loss_tokens": sum(int(unit["loss_tokens"]) for unit in step_units),
+                "min_units": min(min_units_per_step, len(step_units)),
+                "epoch": epoch,
+            })
+    if not plan:
+        raise ValueError("training schedule produced no optimizer steps")
+    return plan
+
+
 def load_initial_theta(adapter_dir: Path) -> dict[str, torch.Tensor]:
     adapter_config = json.loads((adapter_dir / "adapter_config.json").read_text())
     if int(adapter_config.get("r", -1)) != 8 or int(adapter_config.get("lora_alpha", -1)) != 16:
@@ -82,7 +111,9 @@ class Application:
                  adapter_config_dir: Path, manifest: dict,
                  auto_training_complete_on_round_close: bool,
                  hf_adapter_repo: str | None = None, hf_token: str | None = None,
-                 hf_adapter_private: bool = True):
+                 hf_adapter_private: bool = True,
+                 round_plan: list[dict] | None = None,
+                 hf_push_every_steps: int = 10):
         self.coordinator = coordinator
         self.token = token
         self.run_dir = run_dir
@@ -92,19 +123,32 @@ class Application:
         self.hf_adapter_repo = hf_adapter_repo
         self.hf_token = hf_token
         self.hf_adapter_private = hf_adapter_private
-        self.last_hub_push_fingerprint: tuple[int, str] | None = None
-        self.active_hub_push_fingerprint: tuple[int, str] | None = None
-        self.hub_push_thread: threading.Thread | None = None
+        self.hf_push_every_steps = int(hf_push_every_steps)
+        self.round_plan = round_plan or [{
+            "units": list(coordinator.units.values()),
+            "target_loss_tokens": coordinator.target_loss_tokens,
+            "min_units": coordinator.min_units,
+        }]
+        self.round_index = 0
+        self.hub_push_versions: dict[str, dict] = {}
         self.hub_push_status = {
             "enabled": hf_adapter_repo is not None,
             "status": "pending" if hf_adapter_repo is not None else "disabled",
         }
         self.persist_lock = threading.RLock()
+        self.hub_push_queue: queue.Queue = queue.Queue()
+        self.hub_push_thread: threading.Thread | None = None
         self.event_cursor = 0
         self.run_dir.mkdir(parents=True, exist_ok=True)
         (self.run_dir / "gradients").mkdir(exist_ok=True)
         shutil.copy2(adapter_config_dir / "adapter_config.json", self.run_dir / "adapter_config.json")
         (self.run_dir / "data_manifest.json").write_text(json.dumps(manifest, indent=2, ensure_ascii=False) + "\n")
+        if self.hf_adapter_repo is not None:
+            (self.run_dir / "hub_push_queue").mkdir(exist_ok=True)
+            self.hub_push_thread = threading.Thread(
+                target=self._hub_push_loop, name="rwkv-hub-push-queue", daemon=True
+            )
+            self.hub_push_thread.start()
 
     def persist_events(self) -> None:
         with self.persist_lock:
@@ -144,6 +188,8 @@ class Application:
                 "tokenizer": self.coordinator.tokenizer,
                 "worker_code_sha256": self.coordinator.worker_code_sha256,
                 "data_manifest_sha256": self.manifest["manifest_sha256"],
+                "round_index": self.round_index,
+                "planned_rounds": len(self.round_plan),
                 "accepted_results": [
                     {key: value for key, value in result.items() if key != "gradients"}
                     for result in self.coordinator.accepted.values()
@@ -160,34 +206,53 @@ class Application:
             state = json.loads(state_path.read_text())
         except FileNotFoundError:
             state = {}
-        state["hub_push"] = self.hub_push_status
+        state["hub_push"] = {
+            **self.hub_push_status,
+            "versions": self.hub_push_versions,
+            "every_steps": self.hf_push_every_steps,
+        }
         temp = state_path.with_suffix(".tmp")
         temp.write_text(json.dumps(state, indent=2, ensure_ascii=False) + "\n")
         temp.replace(state_path)
 
-    def start_hub_push(self) -> dict:
-        """Queue an immutable adapter snapshot and upload it without blocking workers."""
+    def start_hub_push(self, *, final: bool = False, force: bool = False) -> dict:
+        """Queue a versioned adapter snapshot when due, without blocking workers."""
         if self.hf_adapter_repo is None:
             return dict(self.hub_push_status)
-        snapshot_dir = None
         with self.persist_lock:
-            fingerprint = (self.coordinator.theta_version, self.coordinator.theta_hash)
-            if fingerprint == self.last_hub_push_fingerprint:
+            step = self.coordinator.theta_version
+            if step <= 0:
                 return dict(self.hub_push_status)
-            if fingerprint == self.active_hub_push_fingerprint:
+            if not (force or final or step % self.hf_push_every_steps == 0):
                 return dict(self.hub_push_status)
-
+            key = f"{step:06d}"
+            previous = self.hub_push_versions.get(key, {}).get("status")
+            if previous in ("queued", "uploading", "uploaded"):
+                self.hub_push_status = self.hub_push_versions[key]
+                return dict(self.hub_push_status)
             path_in_repo = (
                 f"checkpoints/{self.coordinator.run_id}/"
-                f"theta-{self.coordinator.theta_version:06d}"
+                f"theta-{step:06d}"
             )
+            snapshot_dir = self.run_dir / "hub_push_queue" / f"theta-{step:06d}"
             try:
-                snapshot_dir = Path(tempfile.mkdtemp(prefix="rwkv-hub-push-"))
+                snapshot_dir.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(self.run_dir / "adapter_config.json", snapshot_dir / "adapter_config.json")
                 shutil.copy2(self.run_dir / "adapter_model.safetensors", snapshot_dir / "adapter_model.safetensors")
+                metadata = {
+                    "run_id": self.coordinator.run_id,
+                    "round_id": self.coordinator.round_id,
+                    "theta_version": step,
+                    "theta_hash": self.coordinator.theta_hash,
+                    "base": self.coordinator.base,
+                    "tokenizer": self.coordinator.tokenizer,
+                    "data_manifest_sha256": self.manifest["manifest_sha256"],
+                    "close_metrics": self.coordinator.close_metrics,
+                }
+                (snapshot_dir / "metadata.json").write_text(
+                    json.dumps(metadata, indent=2, ensure_ascii=False) + "\n"
+                )
             except Exception as exc:
-                if snapshot_dir is not None:
-                    shutil.rmtree(snapshot_dir, ignore_errors=True)
                 error_message = str(exc)
                 if self.hf_token:
                     error_message = error_message.replace(self.hf_token, "[REDACTED]")
@@ -195,90 +260,122 @@ class Application:
                     "enabled": True,
                     "status": "failed",
                     "repo_id": self.hf_adapter_repo,
-                    "theta_version": self.coordinator.theta_version,
+                    "theta_version": step,
                     "theta_hash": self.coordinator.theta_hash,
                     "error": f"{type(exc).__name__}: {error_message}",
                 }
+                self.hub_push_versions[key] = dict(self.hub_push_status)
                 self._write_hub_status_locked()
                 return dict(self.hub_push_status)
-            metadata = {
-                "run_id": self.coordinator.run_id,
-                "round_id": self.coordinator.round_id,
-                "theta_version": self.coordinator.theta_version,
-                "theta_hash": self.coordinator.theta_hash,
-                "base": self.coordinator.base,
-                "tokenizer": self.coordinator.tokenizer,
-                "data_manifest_sha256": self.manifest["manifest_sha256"],
-                "close_metrics": self.coordinator.close_metrics,
-            }
-            self.active_hub_push_fingerprint = fingerprint
             self.hub_push_status = {
                 "enabled": True,
                 "status": "queued",
                 "repo_id": self.hf_adapter_repo,
                 "path_in_repo": path_in_repo,
-                "theta_version": self.coordinator.theta_version,
+                "theta_version": step,
                 "theta_hash": self.coordinator.theta_hash,
             }
+            self.hub_push_versions[key] = dict(self.hub_push_status)
             self._write_hub_status_locked()
-            self.hub_push_thread = threading.Thread(
-                target=self._upload_hub_snapshot,
-                args=(snapshot_dir, metadata, fingerprint, path_in_repo),
-                name="rwkv-hub-adapter-push",
-                daemon=True,
-            )
-            self.hub_push_thread.start()
+            self.hub_push_queue.put((key, snapshot_dir, metadata, path_in_repo))
             return dict(self.hub_push_status)
 
-    def _upload_hub_snapshot(self, snapshot_dir: Path, metadata: dict,
-                             fingerprint: tuple[int, str], path_in_repo: str) -> None:
-        try:
-            commit_url = push_adapter_snapshot(
-                repo_id=self.hf_adapter_repo or "",
-                token=self.hf_token or "",
-                adapter_config_path=snapshot_dir / "adapter_config.json",
-                adapter_weights_path=snapshot_dir / "adapter_model.safetensors",
-                metadata=metadata,
-                path_in_repo=path_in_repo,
-                base_model_id=self.coordinator.base["repo"],
-                base_model_revision=self.coordinator.base["revision"],
-                private=self.hf_adapter_private,
-            )
-            status = {
-                "enabled": True,
-                "status": "uploaded",
-                "repo_id": self.hf_adapter_repo,
-                "path_in_repo": path_in_repo,
-                "theta_version": fingerprint[0],
-                "theta_hash": fingerprint[1],
-                "commit_url": commit_url,
-            }
-        except Exception as exc:
-            error_message = str(exc)
-            if self.hf_token:
-                error_message = error_message.replace(self.hf_token, "[REDACTED]")
-            status = {
-                "enabled": True,
-                "status": "failed",
-                "repo_id": self.hf_adapter_repo,
-                "path_in_repo": path_in_repo,
-                "theta_version": fingerprint[0],
-                "theta_hash": fingerprint[1],
-                "error": f"{type(exc).__name__}: {error_message}",
-            }
-        finally:
-            shutil.rmtree(snapshot_dir, ignore_errors=True)
+    def retry_hub_pushes(self) -> dict:
+        if self.hf_adapter_repo is None:
+            return dict(self.hub_push_status)
         with self.persist_lock:
-            if status["status"] == "uploaded" and (
-                self.last_hub_push_fingerprint is None
-                or fingerprint[0] >= self.last_hub_push_fingerprint[0]
-            ):
-                self.last_hub_push_fingerprint = fingerprint
-            if self.active_hub_push_fingerprint == fingerprint:
-                self.active_hub_push_fingerprint = None
-                self.hub_push_status = status
-                self._write_hub_status_locked()
-        print(json.dumps({"hub_push": status}, ensure_ascii=False), flush=True)
+            queue_root = self.run_dir / "hub_push_queue"
+            for key, previous in sorted(self.hub_push_versions.items()):
+                if previous.get("status") != "failed":
+                    continue
+                snapshot_dir = queue_root / f"theta-{int(key):06d}"
+                metadata_path = snapshot_dir / "metadata.json"
+                if not metadata_path.is_file():
+                    continue
+                metadata = json.loads(metadata_path.read_text())
+                path_in_repo = f"checkpoints/{self.coordinator.run_id}/theta-{int(key):06d}"
+                queued = {**previous, "status": "queued"}
+                self.hub_push_versions[key] = queued
+                self.hub_push_status = queued
+                self.hub_push_queue.put((key, snapshot_dir, metadata, path_in_repo))
+            self._write_hub_status_locked()
+        return self.start_hub_push(force=True)
+
+    def _hub_push_loop(self) -> None:
+        while True:
+            key, snapshot_dir, metadata, path_in_repo = self.hub_push_queue.get()
+            try:
+                with self.persist_lock:
+                    status = {**self.hub_push_versions[key], "status": "uploading"}
+                    self.hub_push_versions[key] = status
+                    self.hub_push_status = status
+                    self._write_hub_status_locked()
+                error = None
+                commit_url = None
+                for attempt in range(3):
+                    try:
+                        commit_url = push_adapter_snapshot(
+                            repo_id=self.hf_adapter_repo or "",
+                            token=self.hf_token or "",
+                            adapter_config_path=snapshot_dir / "adapter_config.json",
+                            adapter_weights_path=snapshot_dir / "adapter_model.safetensors",
+                            metadata=metadata,
+                            path_in_repo=path_in_repo,
+                            base_model_id=self.coordinator.base["repo"],
+                            base_model_revision=self.coordinator.base["revision"],
+                            private=self.hf_adapter_private,
+                        )
+                        error = None
+                        break
+                    except Exception as exc:
+                        error = exc
+                        if attempt < 2:
+                            time.sleep(2 ** attempt)
+                if error is None:
+                    result = {**status, "status": "uploaded", "commit_url": commit_url}
+                    shutil.rmtree(snapshot_dir, ignore_errors=True)
+                else:
+                    message = str(error)
+                    if self.hf_token:
+                        message = message.replace(self.hf_token, "[REDACTED]")
+                    result = {**status, "status": "failed",
+                              "error": f"{type(error).__name__}: {message}"}
+                with self.persist_lock:
+                    self.hub_push_versions[key] = result
+                    if int(key) >= int(self.hub_push_status.get("theta_version", 0)):
+                        self.hub_push_status = result
+                    self._write_hub_status_locked()
+                print(json.dumps({"hub_push": result}, ensure_ascii=False), flush=True)
+            except Exception as exc:
+                message = str(exc)
+                if self.hf_token:
+                    message = message.replace(self.hf_token, "[REDACTED]")
+                result = {"enabled": True, "status": "failed", "theta_version": int(key),
+                          "error": f"{type(exc).__name__}: {message}"}
+                with self.persist_lock:
+                    self.hub_push_versions[key] = result
+                    self.hub_push_status = result
+                    try:
+                        self._write_hub_status_locked()
+                    except Exception:
+                        pass
+                print(json.dumps({"hub_push": result}, ensure_ascii=False), flush=True)
+            finally:
+                self.hub_push_queue.task_done()
+
+    def open_next_round(self) -> bool:
+        next_index = self.round_index + 1
+        if next_index >= len(self.round_plan):
+            return False
+        spec = self.round_plan[next_index]
+        self.coordinator.start_next_round(
+            spec["units"],
+            target_loss_tokens=spec["target_loss_tokens"],
+            min_units=spec["min_units"],
+        )
+        self.round_index = next_index
+        self.persist_checkpoint()
+        return True
 
 
 def make_handler(app: Application):
@@ -323,6 +420,16 @@ def make_handler(app: Application):
                 self.send_header("X-Theta-Version", str(desc["theta_version"]))
                 self.end_headers()
                 self.wfile.write(body)
+                return
+            if route.path == "/join":
+                worker_id = parse_qs(route.query).get("worker_id", [""])[0]
+                try:
+                    result = app.coordinator.join(worker_id)
+                    app.persist_events()
+                    self._json(200, result)
+                except ProtocolError as exc:
+                    app.persist_events()
+                    self._json(exc.status, {"error": exc.code, "message": str(exc)})
                 return
             if route.path == "/lease":
                 worker_id = parse_qs(route.query).get("worker_id", [""])[0]
@@ -390,10 +497,15 @@ def make_handler(app: Application):
                     self._json(409, {"error": "hub_push_disabled"})
                     return
                 app.persist_checkpoint()
-                status = app.start_hub_push()
+                status = app.retry_hub_pushes()
                 self._json(202, {"hub_push": status})
                 return
             if route == "/training-complete":
+                if app.round_index != len(app.round_plan) - 1:
+                    self._json(409, {"error": "training_plan_remaining",
+                                     "round_id": app.coordinator.round_id,
+                                     "planned_rounds": len(app.round_plan)})
+                    return
                 try:
                     size = int(self.headers.get("Content-Length", "0"))
                     if size < 0 or size > 1024 * 1024:
@@ -405,7 +517,6 @@ def make_handler(app: Application):
                     app.persist_events()
                     app.persist_checkpoint()
                     self._json(200, result)
-                    app.start_hub_push()
                 except ProtocolError as exc:
                     app.persist_events()
                     self._json(exc.status, {"error": exc.code, "message": str(exc)})
@@ -427,15 +538,20 @@ def make_handler(app: Application):
                 result = app.coordinator.submit_result(metadata, payload)
                 app.persist_result_payload(str(metadata["unit_id"]), payload)
                 if result["round_closed"]:
-                    if app.auto_training_complete_on_round_close:
-                        app.coordinator.signal_training_complete("single_round_budget_satisfied")
                     app.persist_checkpoint()
+                    final_step = app.round_index == len(app.round_plan) - 1
+                    app.start_hub_push(final=final_step)
+                    if final_step:
+                        if app.auto_training_complete_on_round_close:
+                            app.coordinator.signal_training_complete("training_plan_satisfied")
+                            app.persist_checkpoint()
+                    else:
+                        app.open_next_round()
+                        result["next_round"] = app.coordinator.descriptor()
                 else:
                     app.persist_events()
                 result["training_complete"] = app.coordinator.training_complete
                 self._json(200, result)
-                if result["round_closed"]:
-                    app.start_hub_push()
             except ProtocolError as exc:
                 app.persist_events()
                 self._json(exc.status, {"error": exc.code, "message": str(exc)})
@@ -457,7 +573,7 @@ def main() -> None:
     parser.add_argument("--hf-cache-dir", type=Path, default=None)
     parser.add_argument("--hf-token", default=os.environ.get("HF_TOKEN"))
     parser.add_argument("--push-adapter-to-hf", action="store_true",
-                        help="push each newly saved adapter version to a Hugging Face model repository")
+                        help="push periodic and final adapter snapshots to a Hugging Face model repository")
     parser.add_argument("--hf-adapter-repo", default=None,
                         help="destination Hugging Face model repository, e.g. username/rwkv-adapter")
     parser.add_argument("--hf-adapter-public", action="store_true",
@@ -470,6 +586,13 @@ def main() -> None:
     parser.add_argument("--token", default=os.environ.get("RWKV_PROTOCOL_TOKEN"))
     parser.add_argument("--lease-seconds", type=float, default=900)
     parser.add_argument("--learning-rate", type=float, default=1e-4)
+    parser.add_argument("--epochs", type=int, default=1,
+                        help="repeat the pinned unit manifest this many times")
+    parser.add_argument("--units-per-step", type=int, default=0,
+                        help="units in each optimizer update; 0 puts one full epoch in each step")
+    parser.add_argument("--min-units-per-step", type=int, default=2)
+    parser.add_argument("--hf-push-every-steps", type=int, default=10,
+                        help="push every N optimizer updates and always push the final adapter")
     parser.add_argument("--manual-training-complete", action="store_true",
                         help="wait for POST /training-complete after the final round")
     args = parser.parse_args()
@@ -477,6 +600,10 @@ def main() -> None:
         parser.error("set --token or RWKV_PROTOCOL_TOKEN")
     if args.lease_seconds <= 0 or args.learning_rate <= 0:
         parser.error("lease seconds and learning rate must be positive")
+    if args.epochs <= 0 or args.units_per_step < 0 or args.min_units_per_step <= 0:
+        parser.error("epochs/minimum units must be positive and units-per-step cannot be negative")
+    if args.hf_push_every_steps <= 0:
+        parser.error("--hf-push-every-steps must be positive")
     if args.push_adapter_to_hf and not args.hf_adapter_repo:
         parser.error("--push-adapter-to-hf requires --hf-adapter-repo")
     if args.push_adapter_to_hf and not args.hf_token:
@@ -501,11 +628,16 @@ def main() -> None:
     if manifest["model"]["release_manifest_sha256"] != sha256_bytes(release_manifest_path.read_bytes()):
         raise ValueError("local base model manifest does not match the tokenized data shard")
     theta = load_initial_theta(args.initial_adapter_dir)
-    target_tokens = sum(int(unit["loss_tokens"]) for unit in manifest["units"])
+    round_plan = build_round_plan(
+        manifest["units"], epochs=args.epochs, units_per_step=args.units_per_step,
+        min_units_per_step=args.min_units_per_step,
+    )
+    first_step = round_plan[0]
+    target_tokens = first_step["target_loss_tokens"]
     worker_hash = worker_bundle_sha256(Path(__file__).parent)
     coordinator = RoundCoordinator(
         theta=theta,
-        units=manifest["units"],
+        units=first_step["units"],
         run_id=f"g1j1.5b-{int(time.time())}",
         base={
             "repo": MODEL_ID,
@@ -517,7 +649,7 @@ def main() -> None:
         tokenizer=manifest["tokenizer"],
         worker_code_sha256=worker_hash,
         target_loss_tokens=target_tokens,
-        min_units=min(2, len(manifest["units"])),
+        min_units=first_step["min_units"],
         lease_seconds=args.lease_seconds,
         learning_rate=args.learning_rate,
         weight_decay=0.0,
@@ -530,6 +662,8 @@ def main() -> None:
         hf_adapter_repo=args.hf_adapter_repo if args.push_adapter_to_hf else None,
         hf_token=args.hf_token if args.push_adapter_to_hf else None,
         hf_adapter_private=not args.hf_adapter_public,
+        round_plan=round_plan,
+        hf_push_every_steps=args.hf_push_every_steps,
     )
     server = ThreadingHTTPServer((args.bind, args.port), make_handler(app))
     print(json.dumps({
@@ -543,17 +677,22 @@ def main() -> None:
         "round_id": coordinator.round_id,
         "theta_hash": coordinator.theta_hash,
         "target_loss_tokens": target_tokens,
+        "planned_optimizer_steps": len(round_plan),
+        "epochs": args.epochs,
+        "units_per_step": args.units_per_step or len(manifest["units"]),
+        "hf_push_every_steps": args.hf_push_every_steps,
         "min_units": coordinator.min_units,
         "worker_code_sha256": worker_hash,
         "data_manifest_sha256": manifest["manifest_sha256"],
         "training_completion": (
             "manual POST /training-complete" if args.manual_training_complete
-            else "signaled automatically when this single-round budget closes"
+            else f"signaled automatically when all {len(round_plan)} planned optimizer steps close"
         ),
         "adapter_hub_push": (
             {"enabled": True, "repo_id": args.hf_adapter_repo,
              "private_if_created": not args.hf_adapter_public,
-             "cadence": "after each locally persisted adapter version"}
+             "every_optimizer_steps": args.hf_push_every_steps,
+             "final_snapshot": True}
             if args.push_adapter_to_hf else {"enabled": False}
         ),
     }, indent=2), flush=True)

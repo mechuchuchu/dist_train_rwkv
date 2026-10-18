@@ -86,7 +86,7 @@ class Lease:
 
 
 class RoundCoordinator:
-    """In-memory one-round coordinator with lease, dedup, stale and gradient checks."""
+    """In-memory optimizer-step coordinator with lease, dedup, stale and gradient checks."""
 
     def __init__(
         self,
@@ -148,6 +148,87 @@ class RoundCoordinator:
         self.training_complete = False
         self.close_metrics: dict[str, Any] | None = None
         self.events: list[dict[str, Any]] = []
+        self.active_workers: set[str] = set()
+        self.queued_workers: set[str] = set()
+        self.membership_open = True
+
+    def join(self, worker_id: str) -> dict[str, Any]:
+        if not worker_id or len(worker_id) > 128:
+            raise ProtocolError("invalid_worker", "worker_id must be 1..128 chars")
+        with self.lock:
+            if self.training_complete:
+                return {"status": "training_complete", "round_id": self.round_id}
+            new_membership = False
+            if worker_id in self.active_workers:
+                status = "active"
+            elif self.closed or not self.membership_open:
+                new_membership = worker_id not in self.queued_workers
+                self.queued_workers.add(worker_id)
+                status = "waiting_next_round"
+            else:
+                new_membership = True
+                self.active_workers.add(worker_id)
+                status = "active"
+            if new_membership:
+                self.events.append({"event": "worker_joined", "worker_id": worker_id,
+                                    "status": status, "round_id": self.round_id,
+                                    "at": time.time()})
+            return {
+                "status": status,
+                "round_id": self.round_id if status == "active" else self.round_id + 1,
+                "theta_version": self.theta_version,
+                "theta_hash": self.theta_hash if status == "active" else None,
+            }
+
+    def start_next_round(
+        self,
+        units: list[dict[str, Any]],
+        *,
+        target_loss_tokens: int,
+        min_units: int,
+    ) -> dict[str, Any]:
+        if not units:
+            raise ValueError("next round requires at least one unit")
+        if target_loss_tokens <= 0 or min_units <= 0 or min_units > len(units):
+            raise ValueError("invalid next-round budget")
+        next_units: dict[str, dict[str, Any]] = {}
+        for supplied in units:
+            unit = dict(supplied)
+            unit_id = str(unit["unit_id"])
+            if unit_id in next_units:
+                raise ValueError(f"duplicate unit_id {unit_id}")
+            if int(unit["loss_tokens"]) <= 0 or int(unit["total_tokens"]) <= 0:
+                raise ValueError(f"invalid token counts for {unit_id}")
+            if unit.get("unit_sha256") != unit_digest(unit):
+                raise ValueError(f"unit hash mismatch for {unit_id}")
+            next_units[unit_id] = unit
+        with self.lock:
+            if not self.closed:
+                raise ProtocolError("round_open", "cannot advance before the current round closes", 409)
+            if self.training_complete:
+                raise ProtocolError("training_complete", "cannot advance after training completion", 409)
+            self.round_id += 1
+            self.units = next_units
+            self.pending = deque(next_units)
+            self.unit_status = {unit_id: "pending" for unit_id in next_units}
+            self.leases = {}
+            self.accepted = {}
+            self.loss_tokens = 0
+            self.loss_sum = 0.0
+            self.target_loss_tokens = int(target_loss_tokens)
+            self.min_units = int(min_units)
+            self.closed = False
+            self.close_metrics = None
+            self.active_workers.update(self.queued_workers)
+            promoted = sorted(self.queued_workers)
+            self.queued_workers.clear()
+            self.membership_open = True
+            self.events.append({"event": "round_opened", "round_id": self.round_id,
+                                "theta_version": self.theta_version,
+                                "theta_hash": self.theta_hash,
+                                "unit_count": len(next_units),
+                                "promoted_workers": promoted, "at": time.time()})
+            return self.descriptor()
 
     def descriptor(self) -> dict[str, Any]:
         with self.lock:
@@ -170,6 +251,9 @@ class RoundCoordinator:
                 "received_loss_tokens": self.loss_tokens,
                 "received_units": len(self.accepted),
                 "unit_count": len(self.units),
+                "active_workers": len(self.active_workers),
+                "queued_workers": len(self.queued_workers),
+                "membership_open": self.membership_open,
                 "close_metrics": self.close_metrics,
             }
 
@@ -211,6 +295,9 @@ class RoundCoordinator:
         with self.lock:
             if self.closed:
                 return None
+            if worker_id not in self.active_workers:
+                raise ProtocolError("join_pending", "worker is queued for the next round", 409)
+            self.membership_open = False
             now = time.time()
             self._expire_leases(now)
             while self.pending:
@@ -420,6 +507,7 @@ class RoundCoordinator:
         self.theta_version += 1
         self.theta_hash = tensor_map_sha256(self.theta)
         self.closed = True
+        self.membership_open = False
         self.close_metrics = {
             "unit_count": len(self.accepted),
             "loss_tokens": self.loss_tokens,

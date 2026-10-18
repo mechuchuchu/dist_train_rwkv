@@ -58,6 +58,8 @@ class RoundCoordinatorTests(unittest.TestCase):
             lease_seconds=30,
             learning_rate=1e-2,
         )
+        self.assertEqual(self.coordinator.join("worker-0")["status"], "active")
+        self.assertEqual(self.coordinator.join("worker-1")["status"], "active")
 
     def result(self, lease, unit, value):
         payload = encode_tensors({
@@ -152,6 +154,29 @@ class RoundCoordinatorTests(unittest.TestCase):
         self.assertTrue(signal["training_complete"])
         self.assertTrue(self.coordinator.descriptor()["training_complete"])
         self.assertEqual(self.coordinator.events[-1]["event"], "training_complete")
+
+    def test_late_worker_waits_for_next_round_and_is_promoted_with_new_snapshot(self):
+        lease0 = self.coordinator.lease("worker-0")
+        initial_hash = lease0["theta_hash"]
+        queued = self.coordinator.join("worker-late")
+        self.assertEqual(queued["status"], "waiting_next_round")
+        with self.assertRaises(ProtocolError) as caught:
+            self.coordinator.lease("worker-late")
+        self.assertEqual(caught.exception.code, "join_pending")
+
+        lease1 = self.coordinator.lease("worker-1")
+        self.result(lease0, lease0["unit"], 1.0)
+        self.result(lease1, lease1["unit"], 3.0)
+        descriptor = self.coordinator.start_next_round(
+            [make_unit("epoch-2/unit-0", 2)], target_loss_tokens=2, min_units=1
+        )
+        self.assertEqual(descriptor["round_id"], 2)
+        self.assertEqual(descriptor["theta_version"], 1)
+        self.assertNotEqual(descriptor["theta_hash"], initial_hash)
+        self.assertEqual(self.coordinator.join("worker-late")["status"], "active")
+        late_lease = self.coordinator.lease("worker-late")
+        self.assertEqual(late_lease["round_id"], 2)
+        self.assertEqual(late_lease["theta_hash"], descriptor["theta_hash"])
 
 
 if __name__ == "__main__":
