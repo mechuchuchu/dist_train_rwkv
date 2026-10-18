@@ -6,6 +6,8 @@
 
 현재 장비와 13.3B/7.2B LoRA QLoRA 실측은 [`VRAM_Baseline_2026-10-18.md`](VRAM_Baseline_2026-10-18.md)에 기록했다. 사용자가 지정한 7.2B checkpoint는 `rwkv7-g1k-7.2b-20260930-ctx25600.pth`이며 content SHA-256은 `0853d4ce2e4e0629762797d05036a84cc69fb2fb9eff5590dd22aeb518a4c842`다. 그 QLoRA profile도 State Tuning의 initial-state gradient 경로를 대신하지 않는다. 모든 모델 크기의 State Tuning은 해당 autograd backend와 checkpoint를 따로 profile한 뒤 admission한다.
 
+HF 13.3B 설계의 hardware tier는 worker당 단일 GPU 기준이다. BF16 State Tuning reference는 H100 80GB급에서 시작하고, 48GB는 profile 후보로 둔다. 현재 12GB에서 통과한 짧은 NF4 QLoRA는 State Tuning admission 근거가 아니다. 자세한 sequence sweep과 VRAM 기준은 baseline의 [tier 계획](VRAM_Baseline_2026-10-18.md)을 따른다.
+
 ## 1. 목표와 범위
 
 ### 목표

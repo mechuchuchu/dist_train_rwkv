@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 import time
 from collections import Counter
 from pathlib import Path
@@ -88,6 +89,18 @@ def main() -> None:
         default="User: Reply with one short word.\n\nAssistant:",
     )
     parser.add_argument(
+        "--prompt-tokens",
+        type=int,
+        default=None,
+        help="Use this many deterministic synthetic token IDs instead of tokenizing --prompt.",
+    )
+    parser.add_argument(
+        "--wkv-chunk-size",
+        type=int,
+        default=64,
+        help="Chunk width for the HF chunked WKV reference (16 may reduce long-prefill memory).",
+    )
+    parser.add_argument(
         "--output",
         type=Path,
         default=Path(__file__).with_name("hf_rwkv7_nf4_offload_20261018.json"),
@@ -124,6 +137,17 @@ def main() -> None:
         device_map=device_map,
         quantization_config=quantization_config,
     )
+    if args.wkv_chunk_size < 1:
+        raise ValueError("wkv-chunk-size must be positive")
+    if args.wkv_chunk_size != 64:
+        model_module = sys.modules[model.__class__.__module__]
+        original_chunked_wkv = model_module.rwkv7_chunked
+
+        def rwkv7_chunked_with_selected_size(*args, **kwargs):
+            return original_chunked_wkv(*args, chunk_size=args_cli_chunk_size, **kwargs)
+
+        args_cli_chunk_size = args.wkv_chunk_size
+        model_module.rwkv7_chunked = rwkv7_chunked_with_selected_size
     model.eval()
     load_seconds = time.perf_counter() - start_load
 
@@ -136,10 +160,22 @@ def main() -> None:
     tokenizer = AutoTokenizer.from_pretrained(
         str(args.model), trust_remote_code=True, local_files_only=True
     )
-    encoded = tokenizer(args.prompt, return_tensors="pt", add_special_tokens=False)
     embed_device = model.rwkv7.emb.weight.device
-    input_ids = encoded.input_ids.to(embed_device)
-    attention_mask = encoded.attention_mask.to(embed_device)
+    if args.prompt_tokens is not None:
+        if args.prompt_tokens < 1:
+            raise ValueError("prompt-tokens must be positive")
+        torch.manual_seed(20261018)
+        input_ids = torch.randint(
+            0,
+            config_data["vocab_size"],
+            (1, args.prompt_tokens),
+            device=embed_device,
+        )
+        attention_mask = torch.ones_like(input_ids)
+    else:
+        encoded = tokenizer(args.prompt, return_tensors="pt", add_special_tokens=False)
+        input_ids = encoded.input_ids.to(embed_device)
+        attention_mask = encoded.attention_mask.to(embed_device)
 
     bnb_linear_count = sum(isinstance(module, bnb.nn.Linear4bit) for module in model.modules())
     all_linear_count = sum(isinstance(module, torch.nn.Linear) for module in model.modules())
@@ -185,6 +221,7 @@ def main() -> None:
             "vocab_size": config_data["vocab_size"],
             "source_dtype": config_data["dtype"],
             "training_context": 25600,
+            "wkv_chunk_size": args.wkv_chunk_size,
         },
         "software": {
             "torch": torch.__version__,
@@ -215,6 +252,7 @@ def main() -> None:
         },
         "probe": {
             "prompt_tokens": int(input_ids.shape[1]),
+            "synthetic_prompt": args.prompt_tokens is not None,
             "decode_tokens": 1,
             "prefill_logits_finite": bool(torch.isfinite(output.logits).all()),
             "decode_logits_finite": bool(torch.isfinite(decoded.logits).all()),

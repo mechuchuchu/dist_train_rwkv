@@ -1,0 +1,66 @@
+{
+  "status": "failed",
+  "error": "RuntimeError: Function MmBackward0 returned an invalid gradient at index 1 - expected device meta but got cuda:0",
+  "model": "/workspace/RWKV7-G1k-13.3B-20260930",
+  "software": {
+    "torch": "2.14.1+cu126",
+    "torch_cuda": "12.6",
+    "transformers": "5.20.1",
+    "peft": "0.21.2",
+    "bitsandbytes": "0.50.2",
+    "quantization": "NF4 + double quantization",
+    "compute_dtype": "float32",
+    "gradient_checkpointing": true,
+    "cpu_layers_fp32": true
+  },
+  "placement": {
+    "cuda_layers": 40,
+    "cpu_layers": 21,
+    "trainable_lora_tensor_counts_by_device": {
+      "cuda:0": 488
+    },
+    "device_map": {
+      "rwkv7.emb": "cuda:0",
+      "rwkv7.blocks.0-39": "cuda:0",
+      "rwkv7.blocks.40-60": "cpu",
+      "rwkv7.ln_out": "cpu",
+      "head": "cuda:0"
+    }
+  },
+  "lora": {
+    "target_suffixes": [
+      "att.receptance",
+      "att.key",
+      "att.value",
+      "att.output"
+    ],
+    "target_module_count": 244,
+    "trainable_parameter_count": 15990784,
+    "trainable_tensor_count": 488,
+    "non_null_gradient_tensor_count": 0,
+    "gradient_global_norm": null,
+    "quantized_linear_modules": 240
+  },
+  "probe": {
+    "sequence_length": 16,
+    "loss": null,
+    "optimizer_step_completed": false,
+    "load_seconds": 31.988,
+    "forward_backward_optimizer_seconds": 12.933,
+    "memory_before_step": {
+      "process_rss_gib": 17.286,
+      "host_available_gib": 204.54,
+      "cgroup_current_gib": 42.632,
+      "cgroup_limit_gib": 76.43
+    },
+    "memory_after_step": {
+      "process_rss_gib": 17.333,
+      "host_available_gib": 204.891,
+      "cgroup_current_gib": 42.877,
+      "cgroup_limit_gib": 76.43
+    },
+    "cuda_peak_allocated_gib": 7.891,
+    "cuda_peak_reserved_gib": 8.059,
+    "cuda_free_gib_after_step": 3.552
+  }
+}

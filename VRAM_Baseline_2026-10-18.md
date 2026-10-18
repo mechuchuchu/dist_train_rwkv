@@ -125,3 +125,42 @@ Embedding/head 등 BF16 유지 tensor는 실제 개별 shape로 더한다. NF4�
 체크포인트마다 단계적으로 `batch × context`를 sweep한다. synthetic input으로 load 및 forward/backward/optimizer step을 먼저 확인한 후 실제 SFT row와 special-token rows를 포함한 최종 설정을 재측정한다. 총 tokens/step을 키우고 싶으면 안전한 micro-batch 내에서 local gradient accumulation을 적용해 peak를 억제한다. Context 자체는 16-token WKV chunk 경계에 맞추고 checkpoint의 알려진 training context까지 먼저 비교한다. 더 긴 context는 checkpoint별 별도 품질 검증과 VRAM 측정을 거친다.
 
 각 결과에는 model identity/hash, shape metadata, trainable module 목록/rank, quantization recipe, micro-batch, accumulation, context, checkpointing, loss/head 방식, peak allocated/reserved, free VRAM, step time/tokens-per-second, host RSS, OOM, 코드/환경 hash를 함께 기록한다. LoRA, QLoRA, State Tuning은 gradient path가 다르므로 각 recipe에 별도 admission 기록을 둔다.
+
+## VRAM tier 기반 worker 설계 — HF 13.3B 기준
+
+**설계 결정:** 이 분산 프로토콜은 한 worker가 base checkpoint 전체를 로드하는 구성이므로, 우선 worker당 단일 GPU VRAM으로 하드웨어 등급을 정한다. HF `RWKV7-G1k-13.3B-20260930`의 BF16 base weight 자체는 약 **24.72 GiB**다. 따라서 이 모델의 BF16 LoRA와 State Tuning reference worker는 **H100 80GB 등 80GB급 단일 GPU**를 기준으로 설계한다. 48GB는 단기 BF16 학습 후보, 24GB와 12GB는 NF4 QLoRA 위주 tier로 둔다. 이는 실측이 있는 항목과 다음 단계의 후보를 분리한 계획이며, GPU 이름만으로 긴 context의 성공을 보장하지 않는다.
+
+| GPU VRAM tier (예시) | 13.3B에서 맡길 역할 | 근거와 상태 |
+| --- | --- | --- |
+| 12GB — 현재 RTX 3060 | 짧은 context NF4 QLoRA 개발·검증 | 실제 HF attention-only QLoRA에서 `B=1,T=1024` backward/AdamW 통과, peak reserved 9.92 GiB. `T=2048`도 통과했으나 peak 11.36 GiB로 여유 0.24 GiB뿐이고, `T=2560`은 OOM. 기본 개발 한도는 우선 `T≤1024`로 둔다. 이 결과는 CPU 오프로딩 학습이나 State Tuning을 검증하지 않았다. |
+| 24GB — RTX 4090 | NF4 QLoRA의 context·batch 상향 후보 | 24GB는 제품 표기 용량이다. 13.3B BF16 base weight만 24.72 GiB라 BF16 base는 load할 수 없다. NF4 QLoRA로 `T=2048/4096/8192`를 새로 admission할 수 있지만 아직 이 tier의 측정은 없다. |
+| 48GB — RTX 6000 Ada | BF16 base LoRA 및 짧은 State Tuning 후보 | BF16 base 24.72 GiB를 올릴 물리 용량은 있지만, 실제 학습의 activation/loss workspace를 포함한 peak는 미측정이다. 13.3B BF16 LoRA·State Tuning의 낮은 context 후보로 profile한다. |
+| 80GB — H100 80GB 또는 A100 80GB | 13.3B BF16 LoRA/State Tuning의 기준 worker; 긴 context sweep | 기본 기준 tier로 채택한다. 먼저 `T=1024,4096,8192,16384,25600`을 각각 backward/optimizer까지 profile한다. 25,600은 checkpoint training context이지 메모리 admission 결과가 아니다. H100은 BF16 처리량을 우선할 때, A100 80GB는 같은 급의 메모리 기준 비교군으로 둔다. |
+
+NVIDIA product pages list RTX 4090 as 24GB, RTX 6000 Ada as 48GB, and A100/H100 variants as 80GB ([RTX 4090](https://www.nvidia.com/en-au/geforce/graphics-cards/40-series/rtx-4090/), [RTX 6000 Ada](https://www.nvidia.com/en-us/products/workstations/rtx-6000/), [A100](https://www.nvidia.com/en-us/data-center/a100/), [H100 datasheet](https://resources.nvidia.com/en-us-hopper-architecture/nvidia-tensor-core-gpu-datasheet?ncid=GTCS21-NVRVERRALL)). Do not convert product labels directly into a worker budget: use `torch.cuda.mem_get_info()` on the actual instance because the device-reported and process-usable capacities differ.
+
+이 표에서 80GB는 “13.3B 전 모델이 반드시 H100이어야 한다”는 뜻이 아니다. 이미 측정한 **NF4 QLoRA, 짧은 sequence**는 12GB에서 가능하다. 반대로 BF16 base weight가 24GB 카드에 안 들어가므로 BF16 기준을 만들거나 State Tuning의 gradient 경로를 profile할 때는 48/80GB tier를 쓴다. 현재는 State Tuning 13.3B `dS0` gradient가 미검증이므로 80GB를 우선 기준 장비로 삼고, 48GB에서 같은 admission을 통과하면 그때 더 낮은 tier로 내린다.
+
+Admission 기준은 `(checkpoint hash, backend/dtype, adapter target, micro-batch, context, loss/head 경로)`별로 별도 기록한다. 실제 backward와 optimizer step이 finite하게 끝나고, peak reserved 후 usable VRAM의 약 15% 여유가 남는 것을 목표로 한다. Synthetic profile 통과는 실제 assistant-only SFT mask, 추가 token row, 누적 step 및 품질 검증을 대체하지 않는다. 2개의 40GB GPU도 이 worker 구현에서 1개의 80GB GPU처럼 취급하지 않는다. 각 worker 안에 tensor/model parallel이나 ZeRO shard가 구현되고 통신 경로까지 검증된 뒤에만 다중 GPU VRAM을 합산한다. Full-weight fine-tuning은 optimizer/gradient 메모리까지 포함한 별도 설계이며 이 tier 표에서 admission하지 않는다.
+
+### NF4 QLoRA 시퀀스 길이 외삽치
+
+HF 13.3B NF4 attention-only QLoRA의 같은 recipe(`B=1`, rank 8, BF16 base dtype 보존, gradient checkpointing, `use_cache=False`)에서 `T=1024` peak reserved는 9.922 GiB, `T=2048`은 11.359 GiB였다. 이 둘 사이에서 계산한 국소 기울기는 약 **1.437 MiB/token**이고, 직선 근사식은 다음과 같다.
+
+```text
+peak_reserved_estimate(T) ≈ 8.485 GiB + 1.437 MiB × T
+T_candidate ≈ floor_to_multiple_of_16((0.85 × V_usable_GiB - 8.485) × 1024 / 1.437)
+```
+
+`V_usable_GiB`는 GPU 상품명 표기가 아니다. CUDA context를 초기화하고 모델을 올리기 전에 `torch.cuda.mem_get_info()`의 free bytes를 읽어 해당 프로세스가 쓸 수 있는 시작 예산으로 둔다. 15% headroom을 적용했을 때 이 근사는 사용 가능 예산 24/48/80 GiB에서 각각 약 8,480/23,024/25,600-token 후보를 준다. 마지막은 체크포인트 training context 25,600에서 자른 값이다. `T=25,600`의 NF4 QLoRA peak reserved 자체는 이 직선으로 약 44.4 GiB라고 예측된다.
+
+이는 측정한 1,024–2,048-token 구간에서 만든 **시험 시작점용 외삽**이다. 16-token 측정의 고정 overhead, 더 긴 WKV chunk 동작, allocator fragmentation, host/driver 점유 때문에 큰 `T`에서 선형성이 유지된다고 단정할 수 없다. 현재 12GB RTX 3060에서는 `T=1024`가 통과했지만 여유가 약 1.68 GiB였고, `T=2048`은 여유 약 0.24 GiB, `T=2560`은 OOM이었다. 그러므로 24GB는 `T=4096→6144→8192`, 48GB는 `T=8192→16384→20480`, 80GB는 `T=8192→16384→25600` 순으로 실제 backward/optimizer step을 측정한다. 표의 후보 길이는 아직 어느 tier에서도 실측 admission이 아니다.
+
+이 외삽은 이 HF NF4 QLoRA recipe에만 적용한다. BF16 base LoRA는 resident weight가 더 크고, State Tuning은 `dS0` autograd 경로와 activation lifetime이 다르므로 각각 다른 기울기/profile이 필요하다. 13.3B `train_temp` all-linear profile과 추론 전용 offload 결과도 이 식의 데이터로 섞지 않는다.
+
+긴 context 계획은 다음과 같다.
+
+1. 12GB: 기존 측정 재현, `T=1024`를 우선 실사용 후보로 유지하고 실제 데이터에서 재-admission한다.
+2. 24GB NF4: `T=2048→4096→8192`; 각 단계에 assistant-only labels, real loss, optimizer step을 포함한다.
+3. 48GB BF16: `T=1024→4096→8192`; 13.3B BF16 LoRA와 State Tuning을 별도 실행한다.
+4. 80GB BF16: `T=1024→4096→8192→16384→25600`; State Tuning은 먼저 짧은 `dS0` gradient parity를 통과한 뒤 길이를 올린다.

@@ -6,6 +6,8 @@
 
 현재 RTX 3060에서 지정 13.3B와 7.2B checkpoint의 full-model QLoRA 결과는 [`VRAM_Baseline_2026-10-18.md`](VRAM_Baseline_2026-10-18.md)에 기록했다. FP32 master LoRA 기준 13.3B all-linear rank-8은 2,048 tokens/step까지 통과하고 3,072에서 OOM, 7.2B는 4,096 tokens/step 조합까지 통과했다. 13.3B의 2,048은 peak reserved 여유가 약 0.64 GiB뿐이므로 실제 SFT admission 전에는 더 보수적으로 시작한다. 이 결과는 attention-only v1을 대신 측정한 것이 아니다. 선택한 model hash, target module, quant recipe 및 batch/context마다 별도 admission profile을 요구한다.
 
+현재 HF Transformers attention-only 13.3B profile과 GPU VRAM tier 결정은 [`Distributed_RWKV_HF_Transformers_Design.md`](Distributed_RWKV_HF_Transformers_Design.md) 및 baseline의 [VRAM tier 계획](VRAM_Baseline_2026-10-18.md)에 정리했다. 기준 설계는 12GB에서 짧은 NF4 QLoRA, 13.3B BF16 LoRA의 H100 80GB reference worker이며, 실행 경로별 수치를 서로 대체하지 않는다.
+
 ## 0. 다중 checkpoint 지원 원칙
 
 - 7B/13.3B는 모델 선택 label이며 코드는 고정된 layer 수나 폭을 쓰지 않는다. 실제 체크포인트에서 `L=n_layer`, `D=n_embd`, WKV `H=n_head`, `N=head_size`, 각 linear의 `in/out_features`, base vocab `V`, embedding/head shape 및 tied 여부, 학습 context metadata를 읽는다. 모델별 config, tokenizer와 training code가 호환되는 RWKV-7 계열인지도 확인한다.

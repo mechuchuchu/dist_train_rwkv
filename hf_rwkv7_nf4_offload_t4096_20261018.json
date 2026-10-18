@@ -1,0 +1,70 @@
+{
+  "model": "/workspace/RWKV7-G1k-13.3B-20260930",
+  "model_config": {
+    "architecture": "Rwkv7ForCausalLM",
+    "layers": 61,
+    "hidden_size": 4096,
+    "heads": 64,
+    "head_dim": 64,
+    "vocab_size": 65536,
+    "source_dtype": "bfloat16",
+    "training_context": 25600,
+    "wkv_chunk_size": 64
+  },
+  "software": {
+    "torch": "2.14.1+cu126",
+    "torch_cuda": "12.6",
+    "transformers": "5.20.1",
+    "accelerate": "1.15.0",
+    "bitsandbytes": "0.50.2",
+    "quantization": "NF4 + double quantization",
+    "quantized_linear_modules": 240,
+    "fp32_torch_linear_modules": 127,
+    "all_linear_modules": 367,
+    "compute_dtype": "float32",
+    "embedding_dtype": "float32",
+    "head_module_type": "Linear",
+    "head_weight_dtype": "float32",
+    "cpu_offloaded_modules_remain_fp32": true
+  },
+  "placement": {
+    "cuda_layers": 40,
+    "cpu_layers": 21,
+    "device_map": {
+      "rwkv7.emb": "cuda:0",
+      "rwkv7.blocks.0-39": "cuda:0",
+      "rwkv7.blocks.40-60": "cpu",
+      "rwkv7.ln_out": "cpu",
+      "head": "cuda:0"
+    },
+    "cache_wkv_layer_device_counts": {
+      "cuda:0": 40,
+      "cpu": 21
+    }
+  },
+  "probe": {
+    "prompt_tokens": 4096,
+    "synthetic_prompt": true,
+    "decode_tokens": 1,
+    "prefill_logits_finite": true,
+    "decode_logits_finite": true,
+    "prefill_top_token_id": 33,
+    "prefill_top_token_text": " ",
+    "prefill_and_decode_seconds": 35.053,
+    "load_seconds": 30.96,
+    "cpu_memory_before_forward": {
+      "process_rss_gib": 17.321,
+      "host_available_gib": 203.747,
+      "cgroup_current_gib": 42.689
+    },
+    "cpu_memory_after_forward": {
+      "process_rss_gib": 17.812,
+      "host_available_gib": 203.721,
+      "cgroup_current_gib": 43.125
+    },
+    "cuda_peak_allocated_gib": 9.609,
+    "cuda_peak_reserved_gib": 9.723,
+    "cuda_free_gib_after_forward": 3.589,
+    "model_memory_footprint_gib": 23.186
+  }
+}

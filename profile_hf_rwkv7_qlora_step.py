@@ -24,6 +24,11 @@ def main() -> None:
     parser.add_argument("--model", type=Path, default=DEFAULT_MODEL)
     parser.add_argument("--sequence-length", type=int, default=16)
     parser.add_argument(
+        "--preserve-base-dtype",
+        action="store_true",
+        help="Freeze the loaded BF16 base and enable checkpointing without PEFT's full FP32 upcast.",
+    )
+    parser.add_argument(
         "--output",
         type=Path,
         default=Path(__file__).with_name("hf_rwkv7_nf4_qlora_step_20261018.json"),
@@ -56,11 +61,19 @@ def main() -> None:
         quantization_config=quant_config,
     )
     model.config.use_cache = False
-    model = prepare_model_for_kbit_training(
-        model,
-        use_gradient_checkpointing=True,
-        gradient_checkpointing_kwargs={"use_reentrant": False},
-    )
+    if args.preserve_base_dtype:
+        for parameter in model.parameters():
+            parameter.requires_grad = False
+        model.gradient_checkpointing_enable(
+            gradient_checkpointing_kwargs={"use_reentrant": False}
+        )
+        model.enable_input_require_grads()
+    else:
+        model = prepare_model_for_kbit_training(
+            model,
+            use_gradient_checkpointing=True,
+            gradient_checkpointing_kwargs={"use_reentrant": False},
+        )
     model = get_peft_model(
         model,
         LoraConfig(
@@ -124,6 +137,11 @@ def main() -> None:
             "quantization": "NF4 + double quantization",
             "compute_dtype": "bfloat16",
             "gradient_checkpointing": True,
+            "base_dtype_preparation": (
+                "preserve_loaded_bfloat16"
+                if args.preserve_base_dtype
+                else "prepare_model_for_kbit_training_fp32_upcast"
+            ),
         },
         "lora": {
             "target_suffixes": ATTENTION_TARGETS,
