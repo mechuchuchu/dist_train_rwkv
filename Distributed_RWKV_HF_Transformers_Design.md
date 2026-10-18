@@ -12,7 +12,7 @@ The tested environment is `/venv/main`: PyTorch 2.14.1+cu126, Transformers 5.20.
 
 Hardware selection is VRAM-tiered in [`VRAM_Baseline_2026-10-18.md`](VRAM_Baseline_2026-10-18.md). For this 13.3B checkpoint, short-context NF4 QLoRA is already measured on 12 GiB; BF16 LoRA and State Tuning use an 80GB-class GPU (H100 as the primary reference) as the design target. A 48GB GPU is a lower-tier BF16 candidate pending admission. H100 is therefore the reference for the higher-memory recipe, not a blanket requirement for every 13.3B task. All VRAM tiers are per worker; this protocol does not currently combine multiple GPUs inside one worker.
 
-The smaller integrated Transformers checkpoint `RWKV/RWKV7-G1j-1.5B-20260831` has since passed a short TRL SFT run, a sparse-label 8k LoRA step, and a short initial-state gradient canary. See [`G1j_1.5B_Training_Protocol_Validation_2026-10-18.md`](G1j_1.5B_Training_Protocol_Validation_2026-10-18.md). These checks validate local training paths only; full distributed protocol and 13.3B CPU-offload training remain unimplemented/unvalidated.
+The smaller integrated Transformers checkpoint `RWKV/RWKV7-G1j-1.5B-20260831` has passed a short TRL SFT run, a sparse-label 8k LoRA step, a short initial-state gradient canary, and a one-round two-process LoRA-SFT HTTP prototype. See [`G1j_1.5B_Training_Protocol_Validation_2026-10-18.md`](G1j_1.5B_Training_Protocol_Validation_2026-10-18.md). The service is local-development only; multi-round recovery, audit/rollback, remote TLS, State-Tuning transport, and 13.3B CPU-offload training remain unimplemented/unvalidated.
 
 ## 2. NF4 quantization and measured placement
 

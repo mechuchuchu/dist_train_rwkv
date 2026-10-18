@@ -10,6 +10,8 @@ HF 13.3B 설계의 hardware tier는 worker당 단일 GPU 기준이다. BF16 Stat
 
 1.5B HF 체크포인트에서 실제 chunked `Rwkv7Cache` initial-state gradient를 eager 경로와 비교한 짧은 canary가 통과했다. 단일 프로세스 worker-gradient 비교와 제한 사항은 [`G1j_1.5B_Training_Protocol_Validation_2026-10-18.md`](G1j_1.5B_Training_Protocol_Validation_2026-10-18.md)에 기록했다. 이는 긴 문맥 State-Tuning admission이나 분산 round 구현을 검증하지 않는다.
 
+Coordinator/worker 전송 prototype은 현재 LoRA SFT 전용이다. State-Tuning의 `B`, `E_new`, `H_new` tensor schema와 worker gradient는 이 HTTP round에 아직 연결되지 않았다.
+
 ## 1. 목표와 범위
 
 ### 목표

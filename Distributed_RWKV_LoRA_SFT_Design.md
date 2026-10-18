@@ -8,7 +8,9 @@
 
 현재 HF Transformers attention-only 13.3B profile과 GPU VRAM tier 결정은 [`Distributed_RWKV_HF_Transformers_Design.md`](Distributed_RWKV_HF_Transformers_Design.md) 및 baseline의 [VRAM tier 계획](VRAM_Baseline_2026-10-18.md)에 정리했다. 기준 설계는 12GB에서 짧은 NF4 QLoRA, 13.3B BF16 LoRA의 H100 80GB reference worker이며, 실행 경로별 수치를 서로 대체하지 않는다.
 
-HF Transformers 통합 체크포인트 `RWKV/RWKV7-G1j-1.5B-20260831`에서 실제 2-step TRL SFTTrainer, 4k/8k/16k 문맥 admission, summed-gradient canary 및 짧은 State-Tuning gradient 경로를 검증했다. 결과와 한계는 [`G1j_1.5B_Training_Protocol_Validation_2026-10-18.md`](G1j_1.5B_Training_Protocol_Validation_2026-10-18.md)에 있다. 이는 단일 프로세스 검증이며 coordinator/worker 분산 protocol 구현 완료를 뜻하지 않는다.
+HF Transformers 통합 체크포인트 `RWKV/RWKV7-G1j-1.5B-20260831`에서 실제 2-step TRL SFTTrainer, 4k/8k/16k 문맥 admission, summed-gradient canary 및 짧은 State-Tuning gradient 경로를 검증했다. 이 로컬 학습 canary 자체는 단일 프로세스 검사다. 별도로 구현한 첫 LoRA-SFT 분산 prototype의 범위와 한계는 [`G1j_1.5B_Training_Protocol_Validation_2026-10-18.md`](G1j_1.5B_Training_Protocol_Validation_2026-10-18.md)에 있다.
+
+LoRA SFT 분산 실행의 첫 prototype(`g1j_dist_coordinator.py`, `g1j_dist_worker.py`)은 현재 같은 1.5B HF 모델에서 두 worker 프로세스가 순차적으로 참여하는 HTTP round를 통과했다. lease·heartbeat/release·snapshot hash·gradient schema·중복/stale 거부·token-weighted 집계는 구현했지만, multi-round crash recovery, audit/canary, remote TLS는 남아 있다. 실행 기록은 위 validation note를 참조한다.
 
 ## 0. 다중 checkpoint 지원 원칙
 

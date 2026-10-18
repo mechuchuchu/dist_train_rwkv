@@ -1,0 +1,418 @@
+"""Small, explicit protocol primitives for RWKV distributed SFT experiments."""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import math
+import threading
+import time
+import uuid
+from collections import deque
+from dataclasses import dataclass
+from typing import Any
+
+import torch
+from safetensors.torch import load as load_safetensors
+from safetensors.torch import save as save_safetensors
+
+
+def canonical_json(value: object) -> bytes:
+    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()
+
+
+def sha256_bytes(value: bytes) -> str:
+    return hashlib.sha256(value).hexdigest()
+
+
+def tensor_map_sha256(tensors: dict[str, torch.Tensor]) -> str:
+    digest = hashlib.sha256()
+    for name in sorted(tensors):
+        tensor = tensors[name].detach().to(device="cpu").contiguous()
+        digest.update(name.encode())
+        digest.update(b"\0")
+        digest.update(str(tensor.dtype).encode())
+        digest.update(b"\0")
+        digest.update(canonical_json(list(tensor.shape)))
+        digest.update(tensor.view(torch.uint8).numpy().tobytes())
+    return digest.hexdigest()
+
+
+def unit_digest(unit: dict[str, Any]) -> str:
+    content = {key: value for key, value in unit.items() if key != "unit_sha256"}
+    return sha256_bytes(canonical_json(content))
+
+
+def peft_saved_name_to_parameter_name(name: str) -> str:
+    for factor in ("lora_A", "lora_B"):
+        suffix = f".{factor}.weight"
+        if name.endswith(suffix):
+            return name[: -len(suffix)] + f".{factor}.default.weight"
+    raise ValueError(f"Not a supported PEFT LoRA weight name: {name}")
+
+
+def parameter_name_to_peft_saved_name(name: str) -> str:
+    for factor in ("lora_A", "lora_B"):
+        suffix = f".{factor}.default.weight"
+        if name.endswith(suffix):
+            return name[: -len(suffix)] + f".{factor}.weight"
+    raise ValueError(f"Not a supported PEFT LoRA parameter name: {name}")
+
+
+def encode_tensors(tensors: dict[str, torch.Tensor]) -> bytes:
+    return save_safetensors({k: v.detach().to("cpu").contiguous() for k, v in tensors.items()})
+
+
+def decode_tensors(payload: bytes) -> dict[str, torch.Tensor]:
+    return load_safetensors(payload)
+
+
+class ProtocolError(Exception):
+    def __init__(self, code: str, message: str, status: int = 400):
+        super().__init__(message)
+        self.code = code
+        self.status = status
+
+
+@dataclass
+class Lease:
+    lease_id: str
+    unit_id: str
+    worker_id: str
+    expires_at: float
+    round_id: int
+    theta_version: int
+    theta_hash: str
+
+
+class RoundCoordinator:
+    """In-memory one-round coordinator with lease, dedup, stale and gradient checks."""
+
+    def __init__(
+        self,
+        *,
+        theta: dict[str, torch.Tensor],
+        units: list[dict[str, Any]],
+        run_id: str,
+        base: dict[str, Any],
+        tokenizer: dict[str, Any],
+        worker_code_sha256: str,
+        target_loss_tokens: int,
+        min_units: int,
+        lease_seconds: float,
+        learning_rate: float,
+        weight_decay: float = 0.0,
+        global_grad_clip: float | None = None,
+    ):
+        if not theta:
+            raise ValueError("theta must contain trainable tensors")
+        if not units:
+            raise ValueError("at least one work unit is required")
+        self.lock = threading.RLock()
+        self.run_id = run_id
+        self.round_id = 1
+        self.theta_version = 0
+        self.theta = {k: v.detach().to("cpu", torch.float32).contiguous().clone() for k, v in theta.items()}
+        self.expected = {k: tuple(v.shape) for k, v in self.theta.items()}
+        self.theta_hash = tensor_map_sha256(self.theta)
+        self.base = base
+        self.tokenizer = tokenizer
+        self.worker_code_sha256 = worker_code_sha256
+        self.target_loss_tokens = int(target_loss_tokens)
+        self.min_units = int(min_units)
+        self.lease_seconds = float(lease_seconds)
+        self.global_grad_clip = global_grad_clip
+        self.params = {k: torch.nn.Parameter(v.clone()) for k, v in self.theta.items()}
+        self.optimizer = torch.optim.AdamW(
+            list(self.params.values()), lr=learning_rate, weight_decay=weight_decay
+        )
+        self.units: dict[str, dict[str, Any]] = {}
+        for supplied in units:
+            unit = dict(supplied)
+            unit_id = str(unit["unit_id"])
+            if unit_id in self.units:
+                raise ValueError(f"duplicate unit_id {unit_id}")
+            if int(unit["loss_tokens"]) <= 0 or int(unit["total_tokens"]) <= 0:
+                raise ValueError(f"invalid token counts for {unit_id}")
+            expected_hash = unit_digest(unit)
+            if unit.get("unit_sha256") != expected_hash:
+                raise ValueError(f"unit hash mismatch for {unit_id}")
+            self.units[unit_id] = unit
+        self.pending = deque(self.units)
+        self.unit_status = {unit_id: "pending" for unit_id in self.units}
+        self.leases: dict[str, Lease] = {}
+        self.accepted: dict[str, dict[str, Any]] = {}
+        self.loss_tokens = 0
+        self.loss_sum = 0.0
+        self.closed = False
+        self.close_metrics: dict[str, Any] | None = None
+        self.events: list[dict[str, Any]] = []
+
+    def descriptor(self) -> dict[str, Any]:
+        with self.lock:
+            return {
+                "protocol_version": "rwkv-sft-http-v1",
+                "run_id": self.run_id,
+                "round_id": self.round_id,
+                "theta_version": self.theta_version,
+                "theta_hash": self.theta_hash,
+                "status": "closed" if self.closed else "open",
+                "base": self.base,
+                "tokenizer": self.tokenizer,
+                "worker_code_sha256": self.worker_code_sha256,
+                "lora": {"rank": 8, "alpha": 16, "dropout": 0.0, "target_modules": [
+                    "att.receptance", "att.key", "att.value", "att.output"
+                ]},
+                "target_loss_tokens": self.target_loss_tokens,
+                "min_units": self.min_units,
+                "received_loss_tokens": self.loss_tokens,
+                "received_units": len(self.accepted),
+                "unit_count": len(self.units),
+                "close_metrics": self.close_metrics,
+            }
+
+    def snapshot_bytes(self) -> bytes:
+        with self.lock:
+            return encode_tensors(self.theta)
+
+    def _expire_leases(self, now: float) -> None:
+        for lease_id, lease in list(self.leases.items()):
+            if lease.expires_at <= now:
+                self.leases.pop(lease_id, None)
+                if self.unit_status.get(lease.unit_id) == "leased":
+                    self.unit_status[lease.unit_id] = "pending"
+                    self.pending.append(lease.unit_id)
+                self.events.append({
+                    "event": "lease_expired", "unit_id": lease.unit_id,
+                    "lease_id": lease.lease_id, "worker_id": lease.worker_id,
+                    "at": now,
+                })
+
+    def lease(self, worker_id: str) -> dict[str, Any] | None:
+        if not worker_id or len(worker_id) > 128:
+            raise ProtocolError("invalid_worker", "worker_id must be 1..128 chars")
+        with self.lock:
+            if self.closed:
+                return None
+            now = time.time()
+            self._expire_leases(now)
+            while self.pending:
+                unit_id = self.pending.popleft()
+                if self.unit_status[unit_id] != "pending":
+                    continue
+                lease = Lease(
+                    lease_id=uuid.uuid4().hex,
+                    unit_id=unit_id,
+                    worker_id=worker_id,
+                    expires_at=now + self.lease_seconds,
+                    round_id=self.round_id,
+                    theta_version=self.theta_version,
+                    theta_hash=self.theta_hash,
+                )
+                self.leases[lease.lease_id] = lease
+                self.unit_status[unit_id] = "leased"
+                self.events.append({
+                    "event": "lease_issued", "unit_id": unit_id,
+                    "lease_id": lease.lease_id, "worker_id": worker_id,
+                    "expires_at": lease.expires_at,
+                })
+                unit = self.units[unit_id]
+                return {
+                    "run_id": self.run_id,
+                    "round_id": self.round_id,
+                    "theta_version": self.theta_version,
+                    "theta_hash": self.theta_hash,
+                    "lease_id": lease.lease_id,
+                    "worker_id": worker_id,
+                    "lease_seconds": self.lease_seconds,
+                    "lease_expires_at": lease.expires_at,
+                    "unit": unit,
+                }
+            if len(self.accepted) >= self.min_units and self.loss_tokens >= self.target_loss_tokens:
+                self._close_round()
+            return None
+
+    def heartbeat(self, lease_id: str, worker_id: str) -> dict[str, Any]:
+        with self.lock:
+            if self.closed:
+                raise ProtocolError("round_closed", "round is closed", 409)
+            now = time.time()
+            self._expire_leases(now)
+            lease = self.leases.get(lease_id)
+            if lease is None:
+                raise ProtocolError("unknown_lease", "lease is missing or expired", 409)
+            if lease.worker_id != worker_id:
+                raise ProtocolError("worker_lease_mismatch", "lease belongs to another worker", 403)
+            lease.expires_at = now + self.lease_seconds
+            event = {"event": "heartbeat", "lease_id": lease_id,
+                     "unit_id": lease.unit_id, "worker_id": worker_id,
+                     "expires_at": lease.expires_at}
+            self.events.append(event)
+            return {
+                "lease_id": lease_id,
+                "lease_expires_at": lease.expires_at,
+                "round_id": lease.round_id,
+                "theta_version": lease.theta_version,
+                "theta_hash": lease.theta_hash,
+            }
+
+    def release(self, lease_id: str, worker_id: str, reason: str = "worker_leaving") -> dict[str, Any]:
+        with self.lock:
+            if self.closed:
+                raise ProtocolError("round_closed", "round is closed", 409)
+            now = time.time()
+            self._expire_leases(now)
+            lease = self.leases.get(lease_id)
+            if lease is None:
+                raise ProtocolError("unknown_lease", "lease is missing or expired", 409)
+            if lease.worker_id != worker_id:
+                raise ProtocolError("worker_lease_mismatch", "lease belongs to another worker", 403)
+            self.leases.pop(lease_id, None)
+            self.unit_status[lease.unit_id] = "pending"
+            self.pending.appendleft(lease.unit_id)
+            event = {"event": "lease_released", "lease_id": lease_id,
+                     "unit_id": lease.unit_id, "worker_id": worker_id,
+                     "reason": reason[:256], "at": now}
+            self.events.append(event)
+            return {"status": "released", "unit_id": lease.unit_id}
+
+    def _reject_and_requeue(self, lease: Lease, code: str, message: str, status: int = 409):
+        self.leases.pop(lease.lease_id, None)
+        if not self.closed and self.unit_status.get(lease.unit_id) == "leased":
+            self.unit_status[lease.unit_id] = "pending"
+            self.pending.append(lease.unit_id)
+        self.events.append({"event": "result_rejected", "code": code,
+                            "unit_id": lease.unit_id, "lease_id": lease.lease_id,
+                            "worker_id": lease.worker_id, "message": message})
+        raise ProtocolError(code, message, status)
+
+    def submit_result(self, metadata: dict[str, Any], payload: bytes) -> dict[str, Any]:
+        with self.lock:
+            unit_id = str(metadata.get("unit_id", ""))
+            if unit_id in self.accepted:
+                self.events.append({"event": "duplicate_result", "unit_id": unit_id,
+                                    "worker_id": metadata.get("worker_id")})
+                raise ProtocolError("duplicate_unit", f"unit {unit_id} already counted", 409)
+            if self.closed:
+                raise ProtocolError("round_closed", "round is closed", 409)
+            lease_id = str(metadata.get("lease_id", ""))
+            lease = self.leases.get(lease_id)
+            if lease is None:
+                raise ProtocolError("unknown_lease", "lease is missing, expired, or already used", 409)
+            now = time.time()
+            if lease.expires_at <= now:
+                self._expire_leases(now)
+                raise ProtocolError("expired_lease", "lease expired; unit was returned to queue", 409)
+            if lease.unit_id != unit_id:
+                self._reject_and_requeue(lease, "unit_lease_mismatch", "lease does not belong to unit")
+            if lease.worker_id != str(metadata.get("worker_id", "")):
+                self._reject_and_requeue(lease, "worker_lease_mismatch", "lease belongs to another worker", 403)
+            if lease.round_id != int(metadata.get("round_id", -1)) or lease.round_id != self.round_id:
+                self._reject_and_requeue(lease, "stale_round", "result round_id is stale")
+            if lease.theta_version != int(metadata.get("theta_version", -1)):
+                self._reject_and_requeue(lease, "stale_theta", "result theta_version is stale")
+            if lease.theta_hash != str(metadata.get("theta_hash", "")) or lease.theta_hash != self.theta_hash:
+                self._reject_and_requeue(lease, "stale_theta", "result theta hash is stale")
+            if str(metadata.get("worker_code_sha256", "")) != self.worker_code_sha256:
+                self._reject_and_requeue(lease, "worker_code_mismatch", "worker code hash differs", 403)
+            if sha256_bytes(payload) != str(metadata.get("gradient_sha256", "")):
+                self._reject_and_requeue(lease, "gradient_hash_mismatch", "gradient payload hash differs")
+            unit = self.units[unit_id]
+            if str(metadata.get("unit_sha256", "")) != str(unit["unit_sha256"]):
+                self._reject_and_requeue(lease, "unit_hash_mismatch", "result unit hash differs from manifest")
+            loss_tokens = int(metadata.get("loss_tokens", -1))
+            if loss_tokens != int(unit["loss_tokens"]):
+                self._reject_and_requeue(lease, "loss_token_mismatch", "reported loss-token count differs")
+            loss_sum = float(metadata.get("loss_sum", float("nan")))
+            if not math.isfinite(loss_sum) or loss_sum < 0:
+                self._reject_and_requeue(lease, "invalid_loss", "loss_sum must be finite and nonnegative")
+            try:
+                gradients = decode_tensors(payload)
+            except Exception as exc:
+                self._reject_and_requeue(lease, "invalid_payload", f"cannot decode safetensors: {exc}")
+            if set(gradients) != set(self.expected):
+                self._reject_and_requeue(lease, "gradient_names", "gradient tensor names differ from schema")
+            squared_norm = 0.0
+            for name, expected_shape in self.expected.items():
+                grad = gradients[name]
+                if tuple(grad.shape) != expected_shape:
+                    self._reject_and_requeue(lease, "gradient_shape", f"wrong shape for {name}")
+                grad = grad.to(device="cpu", dtype=torch.float32).contiguous()
+                if not torch.isfinite(grad).all().item():
+                    self._reject_and_requeue(lease, "nonfinite_gradient", f"non-finite gradient {name}")
+                gradients[name] = grad
+                squared_norm += float(torch.sum(grad * grad).item())
+            if not math.isfinite(squared_norm):
+                self._reject_and_requeue(lease, "invalid_gradient_norm", "gradient norm is not finite")
+
+            self.leases.pop(lease_id, None)
+            self.unit_status[unit_id] = "done"
+            result = {
+                "unit_id": unit_id,
+                "lease_id": lease_id,
+                "worker_id": lease.worker_id,
+                "round_id": self.round_id,
+                "theta_version": self.theta_version,
+                "theta_hash": self.theta_hash,
+                "loss_tokens": loss_tokens,
+                "loss_sum": loss_sum,
+                "gradient_sha256": metadata["gradient_sha256"],
+                "gradient_norm": math.sqrt(squared_norm),
+                "gradients": gradients,
+                "accepted_at": now,
+            }
+            self.accepted[unit_id] = result
+            self.loss_tokens += loss_tokens
+            self.loss_sum += loss_sum
+            self.events.append({k: v for k, v in result.items() if k != "gradients"} | {"event": "result_accepted"})
+            closed = False
+            if self.loss_tokens >= self.target_loss_tokens and len(self.accepted) >= self.min_units:
+                self._close_round()
+                closed = True
+            return {
+                "status": "accepted",
+                "unit_id": unit_id,
+                "received_units": len(self.accepted),
+                "received_loss_tokens": self.loss_tokens,
+                "round_closed": closed,
+                "theta_version": self.theta_version,
+                "theta_hash": self.theta_hash,
+                "close_metrics": self.close_metrics,
+            }
+
+    def _close_round(self) -> None:
+        if self.closed:
+            return
+        if self.loss_tokens <= 0 or len(self.accepted) < self.min_units:
+            raise ProtocolError("round_not_ready", "minimum units and loss tokens are required", 409)
+        grad_sums = {name: torch.zeros_like(value) for name, value in self.theta.items()}
+        for result in self.accepted.values():
+            for name, grad in result["gradients"].items():
+                grad_sums[name].add_(grad)
+        mean_grads = {name: value / self.loss_tokens for name, value in grad_sums.items()}
+        norm = torch.linalg.vector_norm(torch.stack([g.norm() for g in mean_grads.values()])).item()
+        if self.global_grad_clip is not None and norm > self.global_grad_clip:
+            scale = self.global_grad_clip / max(norm, 1e-12)
+            mean_grads = {name: grad * scale for name, grad in mean_grads.items()}
+        self.optimizer.zero_grad(set_to_none=True)
+        for name, parameter in self.params.items():
+            parameter.grad = mean_grads[name]
+        self.optimizer.step()
+        self.theta = {name: parameter.detach().clone() for name, parameter in self.params.items()}
+        old_hash = self.theta_hash
+        self.theta_version += 1
+        self.theta_hash = tensor_map_sha256(self.theta)
+        self.closed = True
+        self.close_metrics = {
+            "unit_count": len(self.accepted),
+            "loss_tokens": self.loss_tokens,
+            "loss_sum": self.loss_sum,
+            "mean_loss": self.loss_sum / self.loss_tokens,
+            "preclip_gradient_norm": norm,
+            "global_grad_clip": self.global_grad_clip,
+            "theta_hash_before": old_hash,
+            "theta_hash_after": self.theta_hash,
+        }
+        self.events.append({"event": "round_closed", "round_id": self.round_id,
+                            "theta_version": self.theta_version, "metrics": self.close_metrics})
+

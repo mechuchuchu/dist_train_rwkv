@@ -8,7 +8,10 @@ __pycache__/
 # Generated model-weight artifacts; keep JSON manifests and validation reports trackable.
 /artifacts/**/*.safetensors
 
-# Local training outputs
-/checkpoints/
-/outputs/
-/runs/
+# Generated training weights / optimizer state. JSON and JSONL logs stay trackable.
+/checkpoints/**/*.safetensors
+/checkpoints/**/*.pt
+/outputs/**/*.safetensors
+/outputs/**/*.pt
+/runs/**/*.safetensors
+/runs/**/*.pt
