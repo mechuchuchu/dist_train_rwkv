@@ -2,11 +2,26 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
+import re
 import shutil
 import tempfile
 from pathlib import Path
 from typing import Any
+
+OPTIMIZER_POLICIES = ("auto", "always", "never")
+OPTIMIZER_FILE = "optimizer.safetensors"
+_RUN_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+_VERSION_DIR = re.compile(r"^theta-(\d{6,})$")
+
+
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as handle:
+        for block in iter(lambda: handle.read(1 << 20), b""):
+            digest.update(block)
+    return digest.hexdigest()
 
 
 def ensure_hf_checkpoint(
@@ -53,8 +68,26 @@ def push_adapter_snapshot(
     base_model_id: str,
     base_model_revision: str,
     private: bool = True,
+    optimizer_weights_path: Path | None = None,
+    optimizer_policy: str = "auto",
+    report: dict[str, Any] | None = None,
 ) -> str | None:
-    """Upload only a PEFT adapter snapshot and its provenance to the Hub."""
+    """Upload only a PEFT adapter snapshot and its provenance to the Hub.
+
+    `optimizer_weights_path` is the AdamW state as safetensors. Whether it goes
+    up is decided by `optimizer_policy` against the repository's actual
+    visibility, read from the Hub rather than inferred from the `private` flag
+    (an existing private repo stays private even when public was requested):
+
+    * ``never``  - the optimizer state is not uploaded.
+    * ``auto``   - uploaded only when the repository is confirmed private.
+    * ``always`` - uploaded even to a public repository. The moments are a
+      function of the training gradients, so this is an explicit choice.
+
+    When `report` is given it receives ``repo_private`` and ``optimizer_uploaded``.
+    """
+    if optimizer_policy not in OPTIMIZER_POLICIES:
+        raise ValueError(f"optimizer_policy must be one of {', '.join(OPTIMIZER_POLICIES)}")
     if not token:
         raise ValueError("a Hugging Face write token is required to push an adapter")
     if not repo_id.strip():
@@ -76,12 +109,21 @@ def push_adapter_snapshot(
         exist_ok=True,
         token=token,
     )
-    if private:
-        repo_info = api.repo_info(repo_id=repo_id, repo_type="model", token=token)
-        if getattr(repo_info, "private", None) is False:
-            raise PermissionError(
-                f"destination repository {repo_id} is public; use a private repo or explicitly opt into public upload"
-            )
+    repo_info = api.repo_info(repo_id=repo_id, repo_type="model", token=token)
+    repo_private = getattr(repo_info, "private", None)
+    if private and repo_private is False:
+        raise PermissionError(
+            f"destination repository {repo_id} is public; use a private repo or explicitly opt into public upload"
+        )
+    optimizer_source = Path(optimizer_weights_path) if optimizer_weights_path is not None else None
+    upload_optimizer = (
+        optimizer_source is not None
+        and optimizer_source.is_file()
+        and (optimizer_policy == "always" or (optimizer_policy == "auto" and repo_private is True))
+    )
+    if report is not None:
+        report["repo_private"] = repo_private
+        report["optimizer_uploaded"] = upload_optimizer
     with tempfile.TemporaryDirectory(prefix="rwkv-adapter-hub-") as temp_dir:
         staging = Path(temp_dir)
         config = json.loads(config_source.read_text())
@@ -92,6 +134,11 @@ def push_adapter_snapshot(
             json.dumps(config, indent=2, ensure_ascii=False) + "\n"
         )
         shutil.copy2(weights_source, staging / "adapter_model.safetensors")
+        metadata = dict(metadata)
+        metadata["optimizer_included"] = upload_optimizer
+        if upload_optimizer:
+            shutil.copy2(optimizer_source, staging / OPTIMIZER_FILE)
+            metadata["optimizer_sha256"] = _file_sha256(staging / OPTIMIZER_FILE)
         (staging / "adapter_metadata.json").write_text(
             json.dumps(metadata, indent=2, ensure_ascii=False, sort_keys=True) + "\n"
         )
@@ -101,7 +148,56 @@ def push_adapter_snapshot(
             folder_path=str(staging),
             path_in_repo=path_in_repo,
             commit_message=f"Upload RWKV adapter snapshot {metadata.get('theta_hash', '')[:12]}",
-            allow_patterns=["adapter_config.json", "adapter_model.safetensors", "adapter_metadata.json"],
+            allow_patterns=["adapter_config.json", "adapter_model.safetensors",
+                            "adapter_metadata.json", OPTIMIZER_FILE],
             token=token,
         )
     return getattr(result, "commit_url", None)
+
+
+def _checked_run_id(run_id: str) -> str:
+    if not _RUN_ID.match(run_id or ""):
+        raise ValueError(f"unsafe run id for a Hub path: {run_id!r}")
+    return run_id
+
+
+def list_hub_checkpoint_versions(*, repo_id: str, run_id: str, token: str | None) -> list[int]:
+    """Versions of `run_id` that are fully uploaded to the Hub repository, newest first."""
+    prefix = f"checkpoints/{_checked_run_id(run_id)}/"
+    from huggingface_hub import HfApi
+
+    files = HfApi(token=token).list_repo_files(repo_id=repo_id, repo_type="model", token=token)
+    found: dict[int, set[str]] = {}
+    for path in files:
+        if not path.startswith(prefix):
+            continue
+        folder, _, name = path[len(prefix):].partition("/")
+        match = _VERSION_DIR.match(folder)
+        if match:
+            found.setdefault(int(match.group(1)), set()).add(name)
+    needed = {"adapter_model.safetensors", "adapter_metadata.json"}
+    return sorted((version for version, names in found.items() if needed <= names), reverse=True)
+
+
+def download_hub_checkpoint(
+    *, repo_id: str, run_id: str, version: int, token: str | None, local_dir: Path
+) -> Path:
+    """Download one pushed checkpoint folder and return its local path."""
+    if version < 0:
+        raise ValueError("version cannot be negative")
+    relative = f"checkpoints/{_checked_run_id(run_id)}/theta-{version:06d}"
+    from huggingface_hub import snapshot_download
+
+    destination = Path(local_dir).expanduser()
+    destination.mkdir(parents=True, exist_ok=True)
+    snapshot_download(
+        repo_id=repo_id,
+        repo_type="model",
+        allow_patterns=[f"{relative}/*"],
+        local_dir=str(destination),
+        token=token,
+    )
+    folder = destination / relative
+    if not folder.is_dir():
+        raise FileNotFoundError(f"Hub download did not produce {relative} for {repo_id}")
+    return folder

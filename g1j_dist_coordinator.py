@@ -24,6 +24,7 @@ from rwkv_dist_checkpoint import (
     ResumeError,
     check_resume_compatibility,
     list_checkpoint_versions,
+    load_hub_checkpoint,
     load_latest_checkpoint,
     write_checkpoint,
 )
@@ -40,7 +41,14 @@ from rwkv_dist_protocol import (
     unit_digest,
 )
 from rwkv_dist_client import WORKER_BUNDLE_FILES
-from rwkv_hub import ensure_hf_checkpoint, push_adapter_snapshot
+from rwkv_hub import (
+    OPTIMIZER_FILE,
+    OPTIMIZER_POLICIES,
+    download_hub_checkpoint,
+    ensure_hf_checkpoint,
+    list_hub_checkpoint_versions,
+    push_adapter_snapshot,
+)
 
 
 MODEL_ID = "RWKV/RWKV7-G1j-1.5B-20260831"
@@ -201,10 +209,50 @@ def build_coordinator(
             "resumed_round_id": coordinator.round_id,
             "optimizer_restored": bool(loaded.optimizer_tensors),
             "in_flight_round_discarded": True,
+            "source": str(loaded.directory),
             "skipped_checkpoints": list(loaded.skipped),
             "at": time.time(),
         })
     return coordinator, start
+
+
+def load_resume_from_hub(
+    *, repo_id: str, run_id: str, version: int | None, token: str | None, work_dir: Path
+) -> LoadedCheckpoint:
+    """Download and verify a pushed checkpoint, falling back to older versions.
+
+    With `version` given, only that version is tried. Otherwise the newest
+    version that verifies is used and the ones passed over are listed in
+    `skipped`. Hashes catch damaged or partial uploads; they cannot tell a
+    legitimate push from one written by someone else with access to the
+    repository, so only resume from a repository you control.
+    """
+    if version is not None:
+        candidates = [version]
+    else:
+        candidates = list_hub_checkpoint_versions(repo_id=repo_id, run_id=run_id, token=token)
+        if not candidates:
+            raise ResumeError(f"{repo_id} has no complete checkpoints for run {run_id}")
+    skipped: list[str] = []
+    for candidate in candidates:
+        try:
+            folder = download_hub_checkpoint(
+                repo_id=repo_id, run_id=run_id, version=candidate, token=token,
+                local_dir=work_dir,
+            )
+            loaded = load_hub_checkpoint(folder)
+        except (ResumeError, OSError, ValueError) as exc:
+            skipped.append(f"theta-{candidate:06d}: {exc}")
+            continue
+        if loaded.state["run_id"] != run_id or loaded.state["theta_version"] != candidate:
+            skipped.append(
+                f"theta-{candidate:06d}: metadata says run {loaded.state['run_id']!r} "
+                f"version {loaded.state['theta_version']}"
+            )
+            continue
+        loaded.skipped = skipped
+        return loaded
+    raise ResumeError(f"no usable Hub checkpoint for run {run_id}: " + "; ".join(skipped))
 
 
 def _with_status(previous: dict, status: str) -> dict:
@@ -224,6 +272,7 @@ class Application:
                  hf_adapter_private: bool = True,
                  round_plan: list[dict] | None = None,
                  hf_push_every_steps: int = 10,
+                 hf_push_optimizer: str = "auto",
                  start_round_index: int = 0,
                  checkpoint_keep: int = 3,
                  round_plan_sha256: str | None = None):
@@ -237,6 +286,9 @@ class Application:
         self.hf_token = hf_token
         self.hf_adapter_private = hf_adapter_private
         self.hf_push_every_steps = int(hf_push_every_steps)
+        if hf_push_optimizer not in OPTIMIZER_POLICIES:
+            raise ValueError(f"hf_push_optimizer must be one of {', '.join(OPTIMIZER_POLICIES)}")
+        self.hf_push_optimizer = hf_push_optimizer
         self.round_plan = round_plan or [{
             "units": list(coordinator.units.values()),
             "target_loss_tokens": coordinator.target_loss_tokens,
@@ -347,6 +399,7 @@ class Application:
             **self.hub_push_status,
             "versions": self.hub_push_versions,
             "every_steps": self.hf_push_every_steps,
+            "optimizer_policy": self.hf_push_optimizer,
         }
         temp = state_path.with_suffix(".tmp")
         temp.write_text(json.dumps(state, indent=2, ensure_ascii=False) + "\n")
@@ -384,8 +437,18 @@ class Application:
                     "base": self.coordinator.base,
                     "tokenizer": self.coordinator.tokenizer,
                     "data_manifest_sha256": self.manifest["manifest_sha256"],
+                    "planned_rounds": len(self.round_plan),
+                    "round_plan_sha256": self.round_plan_sha256,
+                    "hyperparameters": self.coordinator.hyperparameters(),
                     "close_metrics": self.coordinator.close_metrics,
                 }
+                if self.hf_push_optimizer != "never":
+                    # Read the moments together with the version they belong to; skip
+                    # them rather than pair them with a different adapter.
+                    _, moments, moments_version, moments_hash = self.coordinator.export_state()
+                    if (moments and moments_version == step
+                            and moments_hash == self.coordinator.theta_hash):
+                        save_file(moments, str(snapshot_dir / OPTIMIZER_FILE))
                 (snapshot_dir / "metadata.json").write_text(
                     json.dumps(metadata, indent=2, ensure_ascii=False) + "\n"
                 )
@@ -449,6 +512,8 @@ class Application:
                     self._write_hub_status_locked()
                 error = None
                 commit_url = None
+                report: dict = {}
+                optimizer_file = snapshot_dir / OPTIMIZER_FILE
                 for attempt in range(3):
                     try:
                         commit_url = push_adapter_snapshot(
@@ -461,6 +526,9 @@ class Application:
                             base_model_id=self.coordinator.base["repo"],
                             base_model_revision=self.coordinator.base["revision"],
                             private=self.hf_adapter_private,
+                            optimizer_weights_path=optimizer_file if optimizer_file.is_file() else None,
+                            optimizer_policy=self.hf_push_optimizer,
+                            report=report,
                         )
                         error = None
                         break
@@ -469,7 +537,8 @@ class Application:
                         if attempt < 2:
                             time.sleep(2 ** attempt)
                 if error is None:
-                    result = {**status, "status": "uploaded", "commit_url": commit_url}
+                    result = {**status, "status": "uploaded", "commit_url": commit_url,
+                              "optimizer_uploaded": bool(report.get("optimizer_uploaded", False))}
                     shutil.rmtree(snapshot_dir, ignore_errors=True)
                 else:
                     message = str(error)
@@ -714,6 +783,19 @@ def main() -> None:
                         help="destination Hugging Face model repository, e.g. username/rwkv-adapter")
     parser.add_argument("--hf-adapter-public", action="store_true",
                         help="create the destination repository as public (private by default)")
+    parser.add_argument("--hf-push-optimizer", choices=OPTIMIZER_POLICIES, default="auto",
+                        help="whether pushed checkpoints include the AdamW state needed for an exact "
+                             "resume. auto: only when the repository is private; always: also to a "
+                             "public repository (the moments are derived from training gradients); "
+                             "never: adapter only")
+    parser.add_argument("--resume-from-hf", action="store_true",
+                        help="start from a checkpoint pushed to --hf-adapter-repo (needs --hf-run-id). "
+                             "Use on a fresh --run-dir; use --resume to continue from local files")
+    parser.add_argument("--hf-run-id", default=None,
+                        help="run id of the pushed checkpoints to resume from (the folder under "
+                             "checkpoints/ in the Hub repository)")
+    parser.add_argument("--hf-version", type=int, default=None,
+                        help="exact theta version to resume from; default is the newest that verifies")
     parser.add_argument("--initial-adapter-dir", type=Path,
                         default=Path("artifacts/g1j_1.5b_capybara_sft_protocol"))
     parser.add_argument("--run-dir", type=Path, default=Path("runs/g1j_local_protocol/round-0001"))
@@ -749,14 +831,28 @@ def main() -> None:
         parser.error("--hf-push-every-steps must be positive")
     if args.keep_checkpoints < 1:
         parser.error("--keep-checkpoints must be at least 1")
+    if args.resume and args.resume_from_hf:
+        parser.error("--resume and --resume-from-hf are alternatives; pick one source")
+    if args.resume_from_hf and not (args.hf_adapter_repo and args.hf_run_id):
+        parser.error("--resume-from-hf requires --hf-adapter-repo and --hf-run-id")
+    if (args.hf_run_id or args.hf_version is not None) and not args.resume_from_hf:
+        parser.error("--hf-run-id and --hf-version only apply with --resume-from-hf")
+    if args.hf_version is not None and args.hf_version < 0:
+        parser.error("--hf-version cannot be negative")
     if args.push_adapter_to_hf and not args.hf_adapter_repo:
         parser.error("--push-adapter-to-hf requires --hf-adapter-repo")
     if args.push_adapter_to_hf and not args.hf_token:
         parser.error("--push-adapter-to-hf requires --hf-token or HF_TOKEN (coordinator only)")
-    if args.hf_adapter_repo and not args.push_adapter_to_hf:
-        parser.error("--hf-adapter-repo requires --push-adapter-to-hf")
+    if args.hf_adapter_repo and not (args.push_adapter_to_hf or args.resume_from_hf):
+        parser.error("--hf-adapter-repo requires --push-adapter-to-hf or --resume-from-hf")
     if args.model_id != MODEL_ID or args.model_revision != MODEL_REVISION:
         parser.error("this coordinator prototype is pinned to the G1j 1.5B repo and revision")
+    if args.push_adapter_to_hf and args.hf_push_optimizer == "always" and args.hf_adapter_public:
+        print("WARNING: --hf-push-optimizer always with --hf-adapter-public uploads AdamW moments "
+              "(derived from training gradients) to a public repository.", flush=True)
+    elif args.push_adapter_to_hf and args.hf_push_optimizer == "auto" and args.hf_adapter_public:
+        print("NOTE: optimizer state is withheld from public repositories under --hf-push-optimizer "
+              "auto; a later --resume-from-hf will restart the Adam moments cold.", flush=True)
     if args.bind not in ("127.0.0.1", "localhost", "::1"):
         print("WARNING: this development server is plain HTTP. Expose it only behind TLS/authenticated networking.", flush=True)
     manifest = read_manifest(args.units)
@@ -791,6 +887,20 @@ def main() -> None:
             f"{checkpoint_root} already holds checkpoints; pass --resume to continue "
             "that run or choose a new --run-dir"
         )
+    elif args.resume_from_hf:
+        try:
+            loaded = load_resume_from_hub(
+                repo_id=args.hf_adapter_repo, run_id=args.hf_run_id, version=args.hf_version,
+                token=args.hf_token or None, work_dir=args.run_dir / "hub_resume",
+            )
+        except ResumeError as exc:
+            parser.error(f"cannot resume from the Hub: {exc}")
+        for problem in loaded.skipped:
+            print(f"WARNING: skipped an unusable Hub checkpoint: {problem}", flush=True)
+        if not loaded.optimizer_tensors:
+            print("WARNING: this Hub checkpoint carries no optimizer state; the adapter is restored "
+                  "but the Adam moments start cold, so later steps will differ from an "
+                  "uninterrupted run.", flush=True)
     worker_hash = worker_bundle_sha256(Path(__file__).parent)
     base = {
         "repo": MODEL_ID,
@@ -819,6 +929,7 @@ def main() -> None:
         hf_adapter_private=not args.hf_adapter_public,
         round_plan=round_plan,
         hf_push_every_steps=args.hf_push_every_steps,
+        hf_push_optimizer=args.hf_push_optimizer,
         start_round_index=start_index,
         checkpoint_keep=args.keep_checkpoints,
         round_plan_sha256=plan_sha256,
@@ -836,6 +947,7 @@ def main() -> None:
         "round_id": coordinator.round_id,
         "theta_hash": coordinator.theta_hash,
         "resumed": loaded is not None,
+        "resumed_from": (None if loaded is None else "hub" if args.resume_from_hf else "local"),
         "optimizer_restored": bool(loaded and loaded.optimizer_tensors),
         "target_loss_tokens": target_tokens,
         "planned_optimizer_steps": len(round_plan),
@@ -853,6 +965,7 @@ def main() -> None:
             {"enabled": True, "repo_id": args.hf_adapter_repo,
              "private_if_created": not args.hf_adapter_public,
              "every_optimizer_steps": args.hf_push_every_steps,
+             "optimizer_state": args.hf_push_optimizer,
              "final_snapshot": True}
             if args.push_adapter_to_hf else {"enabled": False}
         ),

@@ -17,6 +17,7 @@ from g1j_dist_coordinator import (
     Application,
     build_coordinator,
     build_round_plan,
+    load_resume_from_hub,
     make_handler,
     round_plan_digest,
 )
@@ -27,6 +28,7 @@ from rwkv_dist_checkpoint import (
     load_checkpoint,
     load_latest_checkpoint,
 )
+from test_rwkv_hub import FakeHub
 from rwkv_dist_protocol import (
     RoundCoordinator,
     decode_tensors,
@@ -358,7 +360,7 @@ def gradient_for(unit_id: str, theta: dict[str, torch.Tensor]) -> dict[str, torc
 
 
 def open_run(root: Path, *, loaded=None, learning_rate: float = 0.05, plan=None,
-             manifest=None, keep: int = 3) -> Application:
+             manifest=None, keep: int = 3, **app_kwargs) -> Application:
     """Start a coordinator the way main() does: fresh, or resumed from `loaded`."""
     plan = plan or make_plan()
     manifest = manifest or RESUME_MANIFEST
@@ -379,6 +381,7 @@ def open_run(root: Path, *, loaded=None, learning_rate: float = 0.05, plan=None,
         adapter_config_dir=config_dir, manifest=manifest,
         auto_training_complete_on_round_close=True, round_plan=plan,
         start_round_index=start, checkpoint_keep=keep, round_plan_sha256=plan_sha256,
+        **app_kwargs,
     )
     app.persist_checkpoint()
     return app
@@ -623,6 +626,165 @@ class CoordinatorResumeTests(unittest.TestCase):
 
         self.run_to_end("pruned", keep=2)
         self.assertEqual(list_checkpoint_versions(self.ckpt_root("pruned")), [3, 2])
+
+
+class CoordinatorHubResumeTests(unittest.TestCase):
+    """Push checkpoints through the real upload code to a fake Hub, then resume from them."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+
+    def reference(self) -> Application:
+        app = open_run(self.root / "reference")
+        with Served(app) as served:
+            served.finish()
+        return app
+
+    def push_first_rounds(self, *, rounds: int, repo_private, policy: str,
+                          public_requested: bool = False) -> tuple[FakeHub, Application]:
+        hub = FakeHub(self.root / "hub", repo_private=repo_private)
+        with patch("huggingface_hub.HfApi", return_value=hub.api()):
+            app = open_run(
+                self.root / "origin", hf_adapter_repo="test/adapter", hf_token="write-token",
+                hf_adapter_private=not public_requested, hf_push_every_steps=1,
+                hf_push_optimizer=policy,
+            )
+            with Served(app) as served:
+                for _ in range(rounds):
+                    served.work("w")
+            app.hub_push_queue.join()
+        return hub, app
+
+    def load_from(self, hub: FakeHub, **kwargs):
+        def fake_list(*, repo_id, run_id, token):
+            folder = hub.root / "checkpoints" / run_id
+            if not folder.is_dir():
+                return []
+            return sorted((int(entry.name.split("-")[1]) for entry in folder.glob("theta-*")),
+                          reverse=True)
+
+        def fake_download(*, repo_id, run_id, version, token, local_dir):
+            return hub.root / "checkpoints" / run_id / f"theta-{version:06d}"
+
+        arguments = dict(repo_id="test/adapter", run_id="run-resume", version=None,
+                         token="read-token", work_dir=self.root / "hub-download")
+        arguments.update(kwargs)
+        with patch("g1j_dist_coordinator.list_hub_checkpoint_versions", fake_list), \
+                patch("g1j_dist_coordinator.download_hub_checkpoint", fake_download):
+            return load_resume_from_hub(**arguments)
+
+    def finish_from(self, loaded) -> Application:
+        app = open_run(self.root / "restored", loaded=loaded)
+        with Served(app) as served:
+            served.finish()
+        return app
+
+    def test_private_repo_resume_through_the_hub_matches_an_uninterrupted_run(self):
+        reference = self.reference()
+        hub, origin = self.push_first_rounds(rounds=1, repo_private=True, policy="auto")
+        folder = hub.root / "checkpoints" / "run-resume" / "theta-000001"
+        self.assertTrue((folder / "optimizer.safetensors").is_file())
+
+        loaded = self.load_from(hub)
+
+        self.assertEqual(loaded.state["theta_version"], 1)
+        self.assertTrue(loaded.optimizer_tensors)
+        local = load_latest_checkpoint(self.root / "origin" / "run" / "ckpt")
+        for name, value in local.optimizer_tensors.items():
+            self.assertTrue(torch.equal(loaded.optimizer_tensors[name], value), name)
+        restored = self.finish_from(loaded)
+        self.assertEqual(restored.coordinator.theta_hash, reference.coordinator.theta_hash)
+        status = json.loads((self.root / "origin" / "run" / "coordinator_state.json").read_text())
+        self.assertTrue(status["hub_push"]["versions"]["000001"]["optimizer_uploaded"])
+        self.assertEqual(status["hub_push"]["optimizer_policy"], "auto")
+
+    def test_public_repo_under_auto_restores_the_adapter_but_not_the_moments(self):
+        reference = self.reference()
+        hub, _ = self.push_first_rounds(rounds=1, repo_private=False, policy="auto",
+                                        public_requested=True)
+        folder = hub.root / "checkpoints" / "run-resume" / "theta-000001"
+        self.assertFalse((folder / "optimizer.safetensors").exists())
+
+        loaded = self.load_from(hub)
+
+        self.assertEqual(loaded.optimizer_tensors, {})
+        self.assertEqual(loaded.state["theta_version"], 1)
+        restored = self.finish_from(loaded)
+        resumed_event = [e for e in restored.coordinator.events if e["event"] == "coordinator_resumed"][0]
+        self.assertFalse(resumed_event["optimizer_restored"])
+        self.assertEqual(restored.coordinator.theta_version, reference.coordinator.theta_version)
+        self.assertNotEqual(restored.coordinator.theta_hash, reference.coordinator.theta_hash)
+
+    def test_always_publishes_the_moments_to_a_public_repo_when_asked(self):
+        reference = self.reference()
+        hub, _ = self.push_first_rounds(rounds=1, repo_private=False, policy="always",
+                                        public_requested=True)
+        loaded = self.load_from(hub)
+        self.assertTrue(loaded.optimizer_tensors)
+        self.assertEqual(self.finish_from(loaded).coordinator.theta_hash,
+                         reference.coordinator.theta_hash)
+
+    def test_never_keeps_the_moments_off_the_hub_even_when_private(self):
+        hub, origin = self.push_first_rounds(rounds=1, repo_private=True, policy="never")
+        folder = hub.root / "checkpoints" / "run-resume" / "theta-000001"
+        self.assertFalse((folder / "optimizer.safetensors").exists())
+        self.assertEqual(self.load_from(hub).optimizer_tensors, {})
+        self.assertFalse(origin.hub_push_versions["000001"]["optimizer_uploaded"])
+
+    def test_newest_hub_version_that_fails_verification_is_skipped(self):
+        hub, _ = self.push_first_rounds(rounds=2, repo_private=True, policy="auto")
+        newest = hub.root / "checkpoints" / "run-resume" / "theta-000002" / "adapter_model.safetensors"
+        data = bytearray(newest.read_bytes())
+        data[-1] ^= 0xFF
+        newest.write_bytes(bytes(data))
+
+        loaded = self.load_from(hub)
+        self.assertEqual(loaded.state["theta_version"], 1)
+        self.assertEqual(len(loaded.skipped), 1)
+        self.assertIn("theta-000002", loaded.skipped[0])
+
+        with self.assertRaisesRegex(ResumeError, "theta-000002"):
+            self.load_from(hub, version=2)
+
+    def test_a_pinned_older_version_can_be_chosen(self):
+        hub, _ = self.push_first_rounds(rounds=2, repo_private=True, policy="auto")
+        self.assertEqual(self.load_from(hub, version=1).state["theta_version"], 1)
+        self.assertEqual(self.load_from(hub).state["theta_version"], 2)
+
+    def test_an_unknown_run_has_nothing_to_resume(self):
+        hub, _ = self.push_first_rounds(rounds=1, repo_private=True, policy="auto")
+        with self.assertRaisesRegex(ResumeError, "no complete checkpoints"):
+            self.load_from(hub, run_id="some-other-run")
+
+    def test_a_folder_whose_metadata_names_another_run_or_version_is_not_trusted(self):
+        import shutil
+        hub, _ = self.push_first_rounds(rounds=1, repo_private=True, policy="auto")
+        genuine = hub.root / "checkpoints" / "run-resume" / "theta-000001"
+        shutil.copytree(genuine, hub.root / "checkpoints" / "other-run" / "theta-000001")
+        shutil.copytree(genuine, hub.root / "checkpoints" / "run-resume" / "theta-000005")
+
+        with self.assertRaisesRegex(ResumeError, "metadata says run 'run-resume' version 1"):
+            self.load_from(hub, run_id="other-run")
+        with self.assertRaisesRegex(ResumeError, "metadata says run 'run-resume' version 1"):
+            self.load_from(hub, version=5)
+        # Unpinned, the mislabelled newest folder is skipped and the genuine one is used.
+        loaded = self.load_from(hub)
+        self.assertEqual(loaded.state["theta_version"], 1)
+        self.assertEqual(len(loaded.skipped), 1)
+
+    def test_a_hub_checkpoint_from_a_different_configuration_is_refused_on_resume(self):
+        hub, _ = self.push_first_rounds(rounds=1, repo_private=True, policy="auto")
+        loaded = self.load_from(hub)
+        with self.assertRaisesRegex(ResumeError, "hyperparameters"):
+            open_run(self.root / "restored", loaded=loaded, learning_rate=0.5)
+        with self.assertRaisesRegex(ResumeError, "round_plan_sha256"):
+            open_run(self.root / "restored", loaded=loaded, plan=make_plan(units_per_step=3))
+
+    def test_unknown_optimizer_policy_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "hf_push_optimizer"):
+            open_run(self.root / "bad", hf_push_optimizer="sometimes")
 
 
 if __name__ == "__main__":
