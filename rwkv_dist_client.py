@@ -35,6 +35,61 @@ class CoordinatorWaitExpired(RuntimeError):
         self.waited_seconds = waited_seconds
 
 
+class StaleLease(RuntimeError):
+    """A lease no longer matches the coordinator's current adapter snapshot.
+
+    This is an expected race, not corruption: another worker can close the
+    round between this worker's /round, /lease and /snapshot requests. The
+    worker should drop the lease and re-sync with the coordinator.
+    """
+
+
+def check_lease_current(lease: dict, descriptor: dict) -> None:
+    """Raise StaleLease when a lease and a round descriptor disagree on theta."""
+    if (lease["theta_hash"] != descriptor["theta_hash"]
+            or lease["theta_version"] != descriptor["theta_version"]):
+        raise StaleLease(
+            "lease was issued against a different adapter snapshot than the round descriptor"
+        )
+
+
+def fetch_leased_snapshot(request: Callable[..., tuple], lease: dict) -> bytes:
+    """Download /snapshot and return its bytes only if it is the leased theta.
+
+    `request` has the signature of `CoordinatorWaiter.request`. Only the
+    response header is compared here; the caller still verifies that the
+    payload hashes to the leased theta before applying it, so a genuinely
+    corrupt payload is not mistaken for a stale one.
+    """
+    _, headers, payload = request("/snapshot")
+    if headers.get("X-Theta-Hash") != lease["theta_hash"]:
+        raise StaleLease("snapshot response does not match leased theta hash")
+    return payload
+
+
+def release_stale_lease(client: "Client", lease: dict, worker_id: str,
+                        reason: str = "stale_lease") -> str:
+    """Best-effort release of a dropped lease; never raises on coordinator replies.
+
+    Returns a short outcome label. If the round already advanced the
+    coordinator has discarded the lease (HTTP 409), and if it is unreachable
+    the lease simply expires, so neither case needs handling by the caller.
+    """
+    body = json.dumps({
+        "lease_id": lease["lease_id"],
+        "worker_id": worker_id,
+        "reason": reason,
+    }).encode()
+    try:
+        client.request("/release", method="POST", body=body,
+                       headers={"Content-Type": "application/json"}, timeout=10.0)
+        return "released"
+    except CoordinatorHTTPError as exc:
+        return "already_gone" if exc.status == 409 else f"rejected_http_{exc.status}"
+    except CoordinatorUnavailable:
+        return "release_unreachable"
+
+
 class Client:
     def __init__(self, base_url: str, token: str):
         self.base_url = base_url.rstrip("/")

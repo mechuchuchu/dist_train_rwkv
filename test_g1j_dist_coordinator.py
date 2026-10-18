@@ -15,6 +15,7 @@ import torch
 from g1j_dist_coordinator import Application, build_round_plan, make_handler
 from rwkv_dist_protocol import (
     RoundCoordinator,
+    decode_tensors,
     encode_tensors,
     sha256_bytes,
     tensor_map_sha256,
@@ -112,11 +113,19 @@ class CoordinatorHubPushTests(unittest.TestCase):
                     saved = json.loads((app.run_dir / "coordinator_state.json").read_text())
                     self.assertEqual(saved["hub_push"]["status"], "failed")
                     self.assertNotIn("write-secret", json.dumps(saved))
+                    self.assertIn("error", saved["hub_push"]["versions"]["000001"])
                     app.retry_hub_pushes()
                     app.hub_push_queue.join()
 
             self.assertEqual(push.call_count, 4)
             self.assertEqual(app.hub_push_status["status"], "uploaded")
+            # The first attempts' error must not follow the version into "uploaded".
+            self.assertNotIn("error", app.hub_push_status)
+            saved = json.loads((app.run_dir / "coordinator_state.json").read_text())
+            self.assertEqual(saved["hub_push"]["status"], "uploaded")
+            self.assertNotIn("error", saved["hub_push"])
+            self.assertEqual(saved["hub_push"]["versions"]["000001"]["status"], "uploaded")
+            self.assertNotIn("error", saved["hub_push"]["versions"]["000001"])
 
 
 class RoundPlanTests(unittest.TestCase):
@@ -141,6 +150,59 @@ class RoundPlanTests(unittest.TestCase):
         for step in plan:
             for unit in step["units"]:
                 self.assertEqual(unit["unit_sha256"], unit_digest(unit))
+
+
+class SnapshotEndpointTests(unittest.TestCase):
+    def test_headers_describe_the_bytes_that_were_returned(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config_dir = root / "initial-adapter"
+            config_dir.mkdir()
+            (config_dir / "adapter_config.json").write_text(json.dumps({
+                "base_model_name_or_path": "/local/base", "inference_mode": True,
+            }))
+            coordinator = make_coordinator()
+            app = Application(
+                coordinator,
+                token="protocol-token",
+                run_dir=root / "run",
+                adapter_config_dir=config_dir,
+                manifest={"manifest_sha256": "d" * 64},
+                auto_training_complete_on_round_close=True,
+            )
+            server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(app))
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            base_url = f"http://127.0.0.1:{server.server_port}"
+
+            def fetch_snapshot():
+                request = Request(base_url + "/snapshot", headers={
+                    "Authorization": "Bearer protocol-token",
+                })
+                with urlopen(request, timeout=5) as response:
+                    return (response.read(), response.headers["X-Theta-Hash"],
+                            response.headers["X-Theta-Version"])
+
+            try:
+                body, header_hash, header_version = fetch_snapshot()
+                self.assertEqual(header_version, "0")
+                self.assertEqual(header_hash, coordinator.theta_hash)
+                self.assertEqual(header_hash, tensor_map_sha256(decode_tensors(body)))
+
+                # After the adapter advances, the pair must advance together.
+                with coordinator.lock:
+                    for tensor in coordinator.theta.values():
+                        tensor.add_(1)
+                    coordinator.theta_version = 1
+                    coordinator.theta_hash = tensor_map_sha256(coordinator.theta)
+                body, header_hash, header_version = fetch_snapshot()
+                self.assertEqual(header_version, "1")
+                self.assertEqual(header_hash, coordinator.theta_hash)
+                self.assertEqual(header_hash, tensor_map_sha256(decode_tensors(body)))
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=5)
 
 
 class MultiStepHTTPTests(unittest.TestCase):

@@ -106,6 +106,15 @@ def load_initial_theta(adapter_dir: Path) -> dict[str, torch.Tensor]:
     return theta
 
 
+def _with_status(previous: dict, status: str) -> dict:
+    """Copy a hub-push record to a new status, dropping the earlier failure's error.
+
+    The error belongs to the attempt that failed; carrying it into
+    "queued"/"uploading"/"uploaded" makes a recovered push look failed.
+    """
+    return {**{k: v for k, v in previous.items() if k != "error"}, "status": status}
+
+
 class Application:
     def __init__(self, coordinator: RoundCoordinator, *, token: str, run_dir: Path,
                  adapter_config_dir: Path, manifest: dict,
@@ -294,7 +303,7 @@ class Application:
                     continue
                 metadata = json.loads(metadata_path.read_text())
                 path_in_repo = f"checkpoints/{self.coordinator.run_id}/theta-{int(key):06d}"
-                queued = {**previous, "status": "queued"}
+                queued = _with_status(previous, "queued")
                 self.hub_push_versions[key] = queued
                 self.hub_push_status = queued
                 self.hub_push_queue.put((key, snapshot_dir, metadata, path_in_repo))
@@ -306,7 +315,7 @@ class Application:
             key, snapshot_dir, metadata, path_in_repo = self.hub_push_queue.get()
             try:
                 with self.persist_lock:
-                    status = {**self.hub_push_versions[key], "status": "uploading"}
+                    status = _with_status(self.hub_push_versions[key], "uploading")
                     self.hub_push_versions[key] = status
                     self.hub_push_status = status
                     self._write_hub_status_locked()
@@ -411,13 +420,12 @@ def make_handler(app: Application):
                 self._json(200, app.coordinator.descriptor())
                 return
             if route.path == "/snapshot":
-                body = app.coordinator.snapshot_bytes()
-                desc = app.coordinator.descriptor()
+                body, theta_hash, theta_version = app.coordinator.snapshot()
                 self.send_response(200)
                 self.send_header("Content-Type", "application/vnd.safetensors")
                 self.send_header("Content-Length", str(len(body)))
-                self.send_header("X-Theta-Hash", desc["theta_hash"])
-                self.send_header("X-Theta-Version", str(desc["theta_version"]))
+                self.send_header("X-Theta-Hash", theta_hash)
+                self.send_header("X-Theta-Version", str(theta_version))
                 self.end_headers()
                 self.wfile.write(body)
                 return

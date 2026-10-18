@@ -26,7 +26,11 @@ from rwkv_dist_client import (
     CoordinatorUnavailable,
     CoordinatorWaitExpired,
     CoordinatorWaiter,
+    StaleLease,
     WORKER_BUNDLE_FILES,
+    check_lease_current,
+    fetch_leased_snapshot,
+    release_stale_lease,
 )
 from rwkv_dist_protocol import (
     decode_tensors,
@@ -253,15 +257,26 @@ def main() -> None:
             continue
 
         lease = lease_response
-        if lease["theta_hash"] != descriptor["theta_hash"] or lease["theta_version"] != descriptor["theta_version"]:
-            raise RuntimeError("lease was issued against a different adapter snapshot")
-        if loaded_theta_hash != lease["theta_hash"]:
-            _, snapshot_headers, snapshot_payload = waiter.request("/snapshot")
-            header_hash = snapshot_headers.get("X-Theta-Hash")
-            if header_hash != lease["theta_hash"]:
-                raise RuntimeError("snapshot response does not match leased theta hash")
-            params = apply_snapshot(model, snapshot_payload, lease["theta_hash"])
-            loaded_theta_hash = lease["theta_hash"]
+        try:
+            check_lease_current(lease, descriptor)
+            if loaded_theta_hash != lease["theta_hash"]:
+                snapshot_payload = fetch_leased_snapshot(waiter.request, lease)
+                # A payload that fails its hash/schema check here is real
+                # corruption, not a race, so apply_snapshot's RuntimeError
+                # is deliberately left to propagate.
+                params = apply_snapshot(model, snapshot_payload, lease["theta_hash"])
+                loaded_theta_hash = lease["theta_hash"]
+        except StaleLease as exc:
+            # The round advanced between /round, /lease and /snapshot. Drop
+            # this lease and re-sync instead of exiting the worker.
+            outcome = release_stale_lease(client, lease, args.worker_id, str(exc))
+            print(json.dumps({"status": "stale_lease_dropped",
+                              "unit_id": lease["unit"]["unit_id"],
+                              "lease_id": lease["lease_id"],
+                              "detail": str(exc),
+                              "release": outcome}), flush=True)
+            time.sleep(args.poll_seconds)
+            continue
         unit = lease["unit"]
         heartbeat_stop = threading.Event()
         heartbeat_errors = []

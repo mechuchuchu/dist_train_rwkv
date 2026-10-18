@@ -261,6 +261,16 @@ class RoundCoordinator:
         with self.lock:
             return encode_tensors(self.theta)
 
+    def snapshot(self) -> tuple[bytes, str, int]:
+        """Return adapter bytes with the theta hash/version they encode.
+
+        All three values are read under one lock so that a round closing
+        concurrently cannot pair the bytes of one adapter version with the
+        hash of another.
+        """
+        with self.lock:
+            return encode_tensors(self.theta), self.theta_hash, self.theta_version
+
     def signal_training_complete(self, reason: str = "training_finished") -> dict[str, Any]:
         with self.lock:
             if not self.closed:

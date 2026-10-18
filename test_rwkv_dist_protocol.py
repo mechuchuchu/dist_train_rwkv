@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import threading
 import unittest
 import time
 
@@ -8,8 +9,10 @@ import torch
 from rwkv_dist_protocol import (
     ProtocolError,
     RoundCoordinator,
+    decode_tensors,
     encode_tensors,
     sha256_bytes,
+    tensor_map_sha256,
     unit_digest,
 )
 
@@ -81,6 +84,38 @@ class RoundCoordinatorTests(unittest.TestCase):
         self.assertEqual(self.coordinator.close_metrics["unit_count"], 2)
         self.assertEqual(self.coordinator.theta_version, 1)
         self.assertNotEqual(self.coordinator.theta_hash, lease0["theta_hash"])
+
+    def test_snapshot_pairs_bytes_with_their_own_hash_and_version(self):
+        before_bytes, before_hash, before_version = self.coordinator.snapshot()
+        self.assertEqual(before_version, 0)
+        self.assertEqual(before_hash, tensor_map_sha256(decode_tensors(before_bytes)))
+
+        lease0 = self.coordinator.lease("worker-0")
+        lease1 = self.coordinator.lease("worker-1")
+        self.result(lease0, lease0["unit"], 1.0)
+        self.assertTrue(self.result(lease1, lease1["unit"], 3.0)["round_closed"])
+
+        after_bytes, after_hash, after_version = self.coordinator.snapshot()
+        self.assertEqual(after_version, 1)
+        self.assertNotEqual(after_hash, before_hash)
+        self.assertEqual(after_hash, tensor_map_sha256(decode_tensors(after_bytes)))
+        self.assertEqual(after_hash, self.coordinator.theta_hash)
+
+    def test_snapshot_is_read_under_the_coordinator_lock(self):
+        finished = threading.Event()
+
+        def read_snapshot():
+            self.coordinator.snapshot()
+            finished.set()
+
+        reader = threading.Thread(target=read_snapshot, daemon=True)
+        with self.coordinator.lock:
+            reader.start()
+            # A reader that ignored the lock would finish while we hold it,
+            # and could observe a half-applied round close.
+            self.assertFalse(finished.wait(0.2))
+        self.assertTrue(finished.wait(5))
+        reader.join(timeout=5)
 
     def test_duplicate_unit_is_rejected(self):
         lease = self.coordinator.lease("worker-0")
