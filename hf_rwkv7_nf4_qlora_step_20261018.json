@@ -1,0 +1,49 @@
+{
+  "model": "/workspace/RWKV7-G1k-13.3B-20260930",
+  "software": {
+    "torch": "2.14.1+cu126",
+    "torch_cuda": "12.6",
+    "transformers": "5.20.1",
+    "peft": "0.21.2",
+    "bitsandbytes": "0.50.2",
+    "quantization": "NF4 + double quantization",
+    "compute_dtype": "bfloat16",
+    "gradient_checkpointing": true
+  },
+  "lora": {
+    "target_suffixes": [
+      "att.receptance",
+      "att.key",
+      "att.value",
+      "att.output"
+    ],
+    "target_module_count": 244,
+    "trainable_parameter_count": 15990784,
+    "trainable_tensors": 488,
+    "non_null_gradient_tensors": 488,
+    "gradient_global_norm": 11.732367515563965,
+    "quantized_linear_modules": 366,
+    "example_targets": [
+      "base_model.model.rwkv7.blocks.0.att.receptance",
+      "base_model.model.rwkv7.blocks.0.att.key",
+      "base_model.model.rwkv7.blocks.0.att.value",
+      "base_model.model.rwkv7.blocks.0.att.output",
+      "base_model.model.rwkv7.blocks.1.att.receptance",
+      "base_model.model.rwkv7.blocks.1.att.key",
+      "base_model.model.rwkv7.blocks.1.att.value",
+      "base_model.model.rwkv7.blocks.1.att.output"
+    ]
+  },
+  "probe": {
+    "sequence_length": 16,
+    "loss": 13.682108879089355,
+    "loss_finite": true,
+    "gradients_finite": true,
+    "optimizer_step_completed": true,
+    "load_seconds": 12.141,
+    "forward_backward_optimizer_seconds": 3.086,
+    "cuda_peak_allocated_gib": 10.14,
+    "cuda_peak_reserved_gib": 10.566,
+    "cuda_free_gib_after_step": 0.931
+  }
+}
