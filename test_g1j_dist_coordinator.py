@@ -13,6 +13,9 @@ from unittest.mock import patch
 
 import torch
 
+import shutil
+from safetensors.torch import load_file, save_file
+
 from g1j_dist_coordinator import (
     Application,
     build_coordinator,
@@ -383,6 +386,8 @@ def open_run(root: Path, *, loaded=None, learning_rate: float = 0.05, plan=None,
         start_round_index=start, checkpoint_keep=keep, round_plan_sha256=plan_sha256,
         **app_kwargs,
     )
+    if loaded is not None:  # the same steps main() takes when resuming
+        app.set_aside_in_flight_gradients()
     app.persist_checkpoint()
     return app
 
@@ -785,6 +790,323 @@ class CoordinatorHubResumeTests(unittest.TestCase):
     def test_unknown_optimizer_policy_is_rejected(self):
         with self.assertRaisesRegex(ValueError, "hf_push_optimizer"):
             open_run(self.root / "bad", hf_push_optimizer="sometimes")
+
+
+def gradient_dirs(root: Path) -> list[str]:
+    folder = root / "run" / "gradients"
+    return sorted(entry.name for entry in folder.iterdir() if entry.is_dir())
+
+
+class GradientRetentionTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+
+    def files_in(self, name: str, round_dir: str) -> int:
+        return len(list((self.root / name / "run" / "gradients" / round_dir).glob("*.safetensors")))
+
+    def test_gradients_are_stored_per_round_and_kept_by_default(self):
+        app = open_run(self.root / "all")
+        with Served(app) as served:
+            served.finish()
+        self.assertEqual(gradient_dirs(self.root / "all"),
+                         ["round-000001", "round-000002", "round-000003"])
+        for round_dir in gradient_dirs(self.root / "all"):
+            self.assertEqual(self.files_in("all", round_dir), 2)
+
+    def test_closed_rounds_beyond_the_retention_count_are_deleted(self):
+        app = open_run(self.root / "keep1", keep_gradient_rounds=1)
+        with Served(app) as served:
+            served.work("w")
+            served.work("w")
+            # Rounds 1 and 2 are closed; only the newest closed round is kept.
+            self.assertEqual(gradient_dirs(self.root / "keep1"), ["round-000002"])
+            served.work("w")
+        self.assertEqual(gradient_dirs(self.root / "keep1"), ["round-000003"])
+
+    def test_zero_drops_closed_rounds_but_never_the_open_one(self):
+        app = open_run(self.root / "keep0", keep_gradient_rounds=0)
+        with Served(app) as served:
+            served.work("w")
+            self.assertEqual(gradient_dirs(self.root / "keep0"), [])
+            served.work("w", max_units=1)         # half of round 2 is in
+            self.assertEqual(gradient_dirs(self.root / "keep0"), ["round-000002"])
+            self.assertEqual(self.files_in("keep0", "round-000002"), 1)
+
+    def test_files_from_the_older_flat_layout_are_never_touched(self):
+        app = open_run(self.root / "legacy", keep_gradient_rounds=0)
+        legacy = self.root / "legacy" / "run" / "gradients" / ("a" * 64 + ".safetensors")
+        legacy.write_bytes(b"old layout")
+        with Served(app) as served:
+            served.finish()
+        self.assertTrue(legacy.is_file())
+
+    def test_a_late_payload_lands_in_the_round_it_was_accepted_in(self):
+        app = open_run(self.root / "late")
+        with Served(app) as served:
+            served.work("w")
+        self.assertEqual(app.coordinator.round_id, 2)
+        app.persist_result_payload("straggler", b"payload", round_id=1)
+        self.assertEqual(self.files_in("late", "round-000001"), 3)
+        self.assertEqual(self.files_in("late", "round-000002"), 0)
+
+    def test_interrupted_rounds_files_are_set_aside_on_resume_then_pruned_with_the_rest(self):
+        crashed = open_run(self.root / "resumed")
+        with Served(crashed) as served:
+            served.work("w")
+            served.work("w", max_units=1)        # one unit of round 2 accepted, then the crash
+        self.assertEqual(self.files_in("resumed", "round-000002"), 1)
+
+        resumed = open_run(self.root / "resumed",
+                           loaded=load_latest_checkpoint(self.root / "resumed" / "run" / "ckpt"),
+                           keep_gradient_rounds=0)
+
+        names = gradient_dirs(self.root / "resumed")
+        self.assertEqual(len([n for n in names if n.startswith("round-000002.discarded-")]), 1)
+        self.assertNotIn("round-000002", names)
+        with Served(resumed) as served:
+            served.work("w")                      # round 2 again, then it closes
+        names = gradient_dirs(self.root / "resumed")
+        # Round 2 is closed and retention is 0, so both the fresh and the set-aside copies go.
+        self.assertEqual(names, [])
+
+    def test_the_http_handler_records_the_round_each_result_was_accepted_in(self):
+        app = open_run(self.root / "spy")
+        with patch.object(app, "persist_result_payload", wraps=app.persist_result_payload) as spy:
+            with Served(app) as served:
+                served.work("w", max_units=1)
+        self.assertEqual(spy.call_args.kwargs["round_id"], 1)
+
+    def test_any_negative_retention_means_keep_everything(self):
+        app = open_run(self.root / "neg", keep_gradient_rounds=-5)
+        with Served(app) as served:
+            served.finish()
+        self.assertEqual(len(gradient_dirs(self.root / "neg")), 3)
+
+
+class HubPushRecoveryTests(unittest.TestCase):
+    """What a restarted coordinator does about Hub pushes the previous process left behind."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.hub = FakeHub(self.root / "hub", repo_private=True)
+        self.hub_kwargs = dict(hf_adapter_repo="test/adapter", hf_token="write-token",
+                               hf_push_every_steps=1)
+
+    # -- helpers -----------------------------------------------------------------
+    def hub_versions(self) -> list[int]:
+        folder = self.hub.root / "checkpoints" / "run-resume"
+        if not folder.is_dir():
+            return []
+        return sorted(int(entry.name.split("-")[1]) for entry in folder.glob("theta-*")
+                      if (entry / "adapter_model.safetensors").is_file()
+                      and (entry / "adapter_metadata.json").is_file())
+
+    def run_origin(self, *, rounds: int, fail_uploads: bool = False, with_hub: bool = True,
+                   hub_policy: str = "auto") -> Application:
+        api = self.hub.api()
+        if fail_uploads:
+            api.upload_folder.side_effect = RuntimeError("hub down write-token")
+        kwargs = dict(self.hub_kwargs, hf_push_optimizer=hub_policy) if with_hub else {}
+        with patch("huggingface_hub.HfApi", return_value=api), patch("g1j_dist_coordinator.time.sleep"):
+            app = open_run(self.root / "origin", keep=10, **kwargs)
+            with Served(app) as served:
+                for _ in range(rounds):
+                    served.work("w")
+            if with_hub:
+                app.hub_push_queue.join()
+        return app
+
+    def resume(self, *, listing="hub", from_version: int | None = None, **overrides):
+        """Resume the origin run in a new Application and run hub recovery to completion."""
+        ckpt = self.root / "origin" / "run" / "ckpt"
+        loaded = (load_latest_checkpoint(ckpt) if from_version is None
+                  else load_checkpoint(ckpt / checkpoint_name(from_version)))
+
+        def list_versions(*, repo_id, run_id, token):
+            if listing == "unreachable":
+                raise ConnectionError("no route to host (token write-token)")
+            return self.hub_versions()[::-1]
+
+        kwargs = dict(self.hub_kwargs, **overrides)
+        with patch("huggingface_hub.HfApi", return_value=self.hub.api()), \
+                patch("g1j_dist_coordinator.list_hub_checkpoint_versions", list_versions), \
+                patch("g1j_dist_coordinator.time.sleep"):
+            app = open_run(self.root / "origin", loaded=loaded, **kwargs)
+            report = app.recover_hub_pushes()
+            app.hub_push_queue.join()
+        return app, report
+
+    def queue_dir(self, version: int) -> Path:
+        return self.root / "origin" / "run" / "hub_push_queue" / f"theta-{version:06d}"
+
+    def state(self) -> dict:
+        return json.loads((self.root / "origin" / "run" / "coordinator_state.json").read_text())
+
+    # -- replay -----------------------------------------------------------------
+    def test_a_push_that_never_reached_the_hub_is_replayed_after_a_restart(self):
+        origin = self.run_origin(rounds=1, fail_uploads=True)
+        self.assertEqual(origin.hub_push_versions["000001"]["status"], "failed")
+        self.assertTrue(self.queue_dir(1).is_dir())
+        self.assertEqual(self.hub_versions(), [])
+
+        app, report = self.resume()
+
+        self.assertEqual(report["replayed"], [1])
+        self.assertEqual(self.hub_versions(), [1])
+        self.assertTrue((self.hub.root / "checkpoints/run-resume/theta-000001/optimizer.safetensors").is_file())
+        self.assertFalse(self.queue_dir(1).exists(), "uploaded entries are cleaned up")
+        entry = app.hub_push_versions["000001"]
+        self.assertEqual((entry["status"], entry["source"]), ("uploaded", "replayed_after_restart"))
+        self.assertNotIn("error", entry)
+        self.assertEqual(app.hub_push_status["status"], "uploaded")
+        self.assertEqual(self.state()["hub_push"]["versions"]["000001"]["status"], "uploaded")
+
+    def test_versions_already_on_the_hub_are_recorded_and_never_pushed_again(self):
+        self.run_origin(rounds=1, fail_uploads=True)
+        # The upload actually landed before the process died.
+        landed = self.hub.root / "checkpoints/run-resume/theta-000001"
+        landed.mkdir(parents=True)
+        shutil.copy2(self.queue_dir(1) / "adapter_model.safetensors", landed)
+        shutil.copy2(self.queue_dir(1) / "metadata.json", landed / "adapter_metadata.json")
+
+        app, report = self.resume()
+
+        self.assertEqual(report["found_on_hub"], [1])
+        self.assertEqual(report["replayed"], [])
+        self.assertFalse(self.queue_dir(1).exists())
+        self.assertEqual(app.hub_push_versions["000001"]["source"], "found_on_hub")
+        before = self.hub.uploads.copy()
+        with patch("huggingface_hub.HfApi", return_value=self.hub.api()):
+            app.start_hub_push(force=True)         # what POST /hub-push does
+            app.hub_push_queue.join()
+        self.assertEqual(self.hub.uploads, before, "nothing is uploaded a second time")
+
+    def test_the_resumed_version_is_pushed_when_it_is_due_and_missing(self):
+        self.run_origin(rounds=1, with_hub=False)
+
+        app, report = self.resume()
+
+        self.assertEqual(report["pushed_resumed_version"], 1)
+        self.assertEqual(self.hub_versions(), [1])
+        self.assertEqual(app.hub_push_versions["000001"]["status"], "uploaded")
+        metadata = json.loads((self.hub.root / "checkpoints/run-resume/theta-000001/adapter_metadata.json").read_text())
+        self.assertEqual(metadata["theta_version"], 1)
+        self.assertEqual(metadata["round_id"], 1, "the round that produced the version, not the open one")
+
+    def test_the_resumed_version_is_left_alone_when_it_is_not_a_push_step(self):
+        self.run_origin(rounds=1, with_hub=False)
+        app, report = self.resume(hf_push_every_steps=10)
+        self.assertIsNone(report["pushed_resumed_version"])
+        self.assertEqual(self.hub_versions(), [])
+
+    def test_the_resumed_version_is_not_pushed_again_when_the_hub_has_it(self):
+        self.run_origin(rounds=1)
+        self.assertEqual(self.hub_versions(), [1])
+        uploads_before = len(self.hub.uploads)
+        app, report = self.resume()
+        self.assertEqual(report["found_on_hub"], [1])
+        self.assertIsNone(report["pushed_resumed_version"])
+        self.assertEqual(len(self.hub.uploads), uploads_before)
+
+    # -- entries that must not be replayed ------------------------------------------
+    def test_entries_from_a_rolled_back_timeline_are_dropped(self):
+        self.run_origin(rounds=2, fail_uploads=True)
+        self.assertTrue(self.queue_dir(2).is_dir())
+        # Version 2's checkpoint is unusable, so resume falls back to version 1.
+        shutil.rmtree(self.root / "origin" / "run" / "ckpt" / checkpoint_name(2))
+
+        app, report = self.resume()
+
+        self.assertEqual(app.coordinator.theta_version, 1)
+        self.assertEqual(report["dropped"], ["theta-000002"])
+        self.assertEqual(report["replayed"], [1])
+        self.assertFalse(self.queue_dir(2).exists())
+        self.assertEqual(self.hub_versions(), [1])
+
+    def test_a_damaged_queue_entry_is_dropped(self):
+        self.run_origin(rounds=1, fail_uploads=True)
+        weights = self.queue_dir(1) / "adapter_model.safetensors"
+        data = bytearray(weights.read_bytes())
+        data[-1] ^= 0xFF
+        weights.write_bytes(bytes(data))
+        app, report = self.resume(hf_push_every_steps=10)
+        self.assertEqual(report["dropped"], ["theta-000001"])
+        self.assertEqual(self.hub_versions(), [])
+
+    def test_an_entry_whose_adapter_disagrees_with_the_local_checkpoint_is_dropped(self):
+        self.run_origin(rounds=1, fail_uploads=True)
+        # Self-consistent but different from what this run actually produced at version 1.
+        entry = self.queue_dir(1)
+        tensors = load_file(str(entry / "adapter_model.safetensors"))
+        tensors = {name: value + 1.0 for name, value in tensors.items()}
+        save_file(tensors, str(entry / "adapter_model.safetensors"))
+        from rwkv_dist_protocol import peft_saved_name_to_parameter_name
+        metadata = json.loads((entry / "metadata.json").read_text())
+        metadata["theta_hash"] = tensor_map_sha256(
+            {peft_saved_name_to_parameter_name(n): t for n, t in tensors.items()})
+        (entry / "metadata.json").write_text(json.dumps(metadata))
+
+        app, report = self.resume(hf_push_every_steps=10)
+
+        self.assertEqual(report["dropped"], ["theta-000001"])
+        self.assertEqual(self.hub_versions(), [])
+
+    def test_entries_of_another_run_are_neither_pushed_nor_deleted(self):
+        self.run_origin(rounds=1, fail_uploads=True)
+        metadata_path = self.queue_dir(1) / "metadata.json"
+        metadata = json.loads(metadata_path.read_text())
+        metadata["run_id"] = "someone-elses-run"
+        metadata_path.write_text(json.dumps(metadata))
+
+        app, report = self.resume(hf_push_every_steps=10)
+
+        self.assertEqual(report["ignored"], ["theta-000001"])
+        self.assertTrue(self.queue_dir(1).is_dir())
+        self.assertEqual(self.hub_versions(), [])
+
+    # -- the hub itself ---------------------------------------------------------------
+    def test_an_unreachable_hub_does_not_stop_the_replay_and_the_error_is_redacted(self):
+        self.run_origin(rounds=1, fail_uploads=True)
+
+        app, report = self.resume(listing="unreachable")
+
+        self.assertIn("ConnectionError", report["hub_error"])
+        self.assertNotIn("write-token", report["hub_error"])
+        self.assertIn("[REDACTED]", report["hub_error"])
+        self.assertEqual(report["replayed"], [1])
+        self.assertEqual(self.hub_versions(), [1])
+
+    def test_a_hub_that_is_ahead_of_the_resumed_version_is_reported_not_recorded(self):
+        self.run_origin(rounds=2)
+        self.assertEqual(self.hub_versions(), [1, 2])
+        shutil.rmtree(self.root / "origin" / "run" / "ckpt" / checkpoint_name(2))
+
+        app, report = self.resume()
+
+        self.assertEqual(app.coordinator.theta_version, 1)
+        self.assertEqual(report["hub_ahead"], [2])
+        self.assertNotIn("000002", app.hub_push_versions)
+        self.assertEqual(report["found_on_hub"], [1])
+
+    def test_nothing_happens_without_hub_pushing(self):
+        self.run_origin(rounds=1, with_hub=False)
+        app, report = self.resume(hf_adapter_repo=None, hf_token=None)
+        self.assertEqual(report["replayed"], [])
+        self.assertIsNone(report["hub_error"])
+        self.assertEqual(self.hub_versions(), [])
+
+    # -- the status file ---------------------------------------------------------------
+    def test_push_history_survives_later_checkpoint_writes(self):
+        app = self.run_origin(rounds=2)
+        self.assertEqual(sorted(self.state()["hub_push"]["versions"]), ["000001", "000002"])
+        app.persist_checkpoint()                    # rewrites coordinator_state.json
+        versions = self.state()["hub_push"]["versions"]
+        self.assertEqual(sorted(versions), ["000001", "000002"])
+        self.assertEqual(versions["000002"]["status"], "uploaded")
 
 
 if __name__ == "__main__":

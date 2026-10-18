@@ -9,6 +9,7 @@ import hashlib
 import json
 import os
 import queue
+import re
 import shutil
 import threading
 import time
@@ -23,6 +24,7 @@ from rwkv_dist_checkpoint import (
     LoadedCheckpoint,
     ResumeError,
     check_resume_compatibility,
+    checkpoint_name,
     list_checkpoint_versions,
     load_hub_checkpoint,
     load_latest_checkpoint,
@@ -36,6 +38,7 @@ from rwkv_dist_protocol import (
     decode_tensors,
     encode_tensors,
     parameter_name_to_peft_saved_name,
+    peft_saved_name_to_parameter_name,
     sha256_bytes,
     tensor_map_sha256,
     unit_digest,
@@ -255,6 +258,14 @@ def load_resume_from_hub(
     raise ResumeError(f"no usable Hub checkpoint for run {run_id}: " + "; ".join(skipped))
 
 
+_QUEUE_ENTRY = re.compile(r"^theta-(\d{6,})$")
+_GRADIENT_ROUND = re.compile(r"^round-(\d{6,})(?:\.discarded-\d+)?$")
+
+
+def _redact(message: str, secret: str | None) -> str:
+    return message.replace(secret, "[REDACTED]") if secret else message
+
+
 def _with_status(previous: dict, status: str) -> dict:
     """Copy a hub-push record to a new status, dropping the earlier failure's error.
 
@@ -275,7 +286,8 @@ class Application:
                  hf_push_optimizer: str = "auto",
                  start_round_index: int = 0,
                  checkpoint_keep: int = 3,
-                 round_plan_sha256: str | None = None):
+                 round_plan_sha256: str | None = None,
+                 keep_gradient_rounds: int = -1):
         self.coordinator = coordinator
         self.token = token
         self.run_dir = run_dir
@@ -296,6 +308,8 @@ class Application:
         }]
         self.round_index = start_round_index
         self.checkpoint_keep = int(checkpoint_keep)
+        # Closed rounds whose per-unit gradient files are kept; -1 keeps all of them.
+        self.keep_gradient_rounds = int(keep_gradient_rounds)
         self.round_plan_sha256 = round_plan_sha256 or round_plan_digest(self.round_plan)
         self.hub_push_versions: dict[str, dict] = {}
         self.hub_push_status = {
@@ -326,12 +340,57 @@ class Application:
                         f.write(json.dumps(event, sort_keys=True, ensure_ascii=False) + "\n")
                 self.event_cursor = len(self.coordinator.events)
 
-    def persist_result_payload(self, unit_id: str, payload: bytes) -> None:
+    def persist_result_payload(self, unit_id: str, payload: bytes,
+                               round_id: int | None = None) -> None:
+        """Store an accepted unit's gradient under ``gradients/round-NNNNNN/``.
+
+        `round_id` is the round the result was accepted in. The handler passes it
+        explicitly because the next round may already be open by the time a
+        slower request gets here.
+        """
+        round_id = self.coordinator.round_id if round_id is None else int(round_id)
+        directory = self.run_dir / "gradients" / f"round-{round_id:06d}"
+        directory.mkdir(parents=True, exist_ok=True)
         safe_name = hashlib.sha256(unit_id.encode()).hexdigest()
-        path = self.run_dir / "gradients" / f"{safe_name}.safetensors"
+        path = directory / f"{safe_name}.safetensors"
         temp = path.with_suffix(".tmp")
         temp.write_bytes(payload)
         temp.replace(path)
+
+    def set_aside_in_flight_gradients(self) -> Path | None:
+        """After a resume, move the open round's earlier gradient files out of the live set.
+
+        They belong to work that was discarded, and a reissued round reuses the
+        same file names for the same units; leaving them in place would blur the
+        old attempt into the new one.
+        """
+        with self.persist_lock:
+            live = self.run_dir / "gradients" / f"round-{self.coordinator.round_id:06d}"
+            if not live.is_dir():
+                return None
+            aside = live.with_name(f"{live.name}.discarded-{int(time.time())}")
+            live.rename(aside)
+            return aside
+
+    def prune_gradients(self) -> list[str]:
+        """Delete gradient folders of closed rounds beyond `keep_gradient_rounds`.
+
+        The open round is never touched. With the default of -1 nothing is deleted.
+        """
+        if self.keep_gradient_rounds < 0:
+            return []
+        root = self.run_dir / "gradients"
+        closed_through = self.coordinator.round_id - (0 if self.coordinator.closed else 1)
+        cutoff = closed_through - self.keep_gradient_rounds
+        removed = []
+        if not root.is_dir():
+            return removed
+        for entry in sorted(root.iterdir()):
+            match = _GRADIENT_ROUND.match(entry.name)
+            if match and entry.is_dir() and int(match.group(1)) <= cutoff:
+                shutil.rmtree(entry, ignore_errors=True)
+                removed.append(entry.name)
+        return removed
 
     def save_resume_checkpoint(self) -> None:
         """Commit the current adapter version for --resume (a no-op if already saved)."""
@@ -385,9 +444,18 @@ class Application:
                 ],
                 "close_metrics": self.coordinator.close_metrics,
             }
-            summary["hub_push"] = self.hub_push_status
+            summary["hub_push"] = self._hub_state_locked()
             (self.run_dir / "coordinator_state.json").write_text(json.dumps(summary, indent=2, ensure_ascii=False) + "\n")
             self.persist_events()
+            self.prune_gradients()
+
+    def _hub_state_locked(self) -> dict:
+        return {
+            **self.hub_push_status,
+            "versions": self.hub_push_versions,
+            "every_steps": self.hf_push_every_steps,
+            "optimizer_policy": self.hf_push_optimizer,
+        }
 
     def _write_hub_status_locked(self) -> None:
         state_path = self.run_dir / "coordinator_state.json"
@@ -395,15 +463,113 @@ class Application:
             state = json.loads(state_path.read_text())
         except FileNotFoundError:
             state = {}
-        state["hub_push"] = {
-            **self.hub_push_status,
-            "versions": self.hub_push_versions,
-            "every_steps": self.hf_push_every_steps,
-            "optimizer_policy": self.hf_push_optimizer,
-        }
+        state["hub_push"] = self._hub_state_locked()
         temp = state_path.with_suffix(".tmp")
         temp.write_text(json.dumps(state, indent=2, ensure_ascii=False) + "\n")
         temp.replace(state_path)
+
+    def _queue_entry_verdict(self, entry: Path, version: int, current: int) -> tuple[str, dict | None]:
+        """Decide what to do with a push left in hub_push_queue by an earlier process.
+
+        Returns ("replay", metadata), ("drop", None) for an entry that is unusable
+        or belongs to a timeline this run no longer follows, or ("ignore", None).
+        """
+        try:
+            metadata = json.loads((entry / "metadata.json").read_text())
+            if int(metadata["theta_version"]) != version:
+                return "drop", None
+        except (OSError, ValueError, KeyError, TypeError):
+            return "drop", None
+        if metadata.get("run_id") != self.coordinator.run_id:
+            return "ignore", None
+        if version > current:
+            return "drop", None  # pushed by a timeline that resume has rolled back past
+        try:
+            raw = load_file(str(entry / "adapter_model.safetensors"), device="cpu")
+            theta = {
+                peft_saved_name_to_parameter_name(name): tensor.float().contiguous()
+                for name, tensor in raw.items() if ".lora_A." in name or ".lora_B." in name
+            }
+            if not theta or tensor_map_sha256(theta) != metadata.get("theta_hash"):
+                return "drop", None
+        except Exception:
+            return "drop", None
+        try:  # when the local checkpoint for that version survives, it must agree
+            kept = json.loads((self.run_dir / "ckpt" / checkpoint_name(version) / "state.json").read_text())
+            if kept.get("theta_hash") != metadata["theta_hash"]:
+                return "drop", None
+        except (OSError, ValueError):
+            pass
+        return "replay", metadata
+
+    def recover_hub_pushes(self) -> dict:
+        """Pick up Hub pushes an earlier process left unfinished, and learn what the Hub holds.
+
+        Call after the startup checkpoint has been persisted. Versions the Hub
+        already has are recorded as uploaded and are never pushed again; leftover
+        queue entries that verify are re-queued; the resumed version itself is
+        pushed if it is due and missing. An unreachable Hub does not stop startup:
+        everything pending is pushed, which at worst repeats an identical upload.
+        """
+        report: dict = {"found_on_hub": [], "replayed": [], "dropped": [], "ignored": [],
+                        "hub_ahead": [], "pushed_resumed_version": None, "hub_error": None}
+        if self.hf_adapter_repo is None:
+            return report
+        run_id = self.coordinator.run_id
+        current = self.coordinator.theta_version
+        remote: set[int] | None = None
+        try:
+            remote = set(list_hub_checkpoint_versions(
+                repo_id=self.hf_adapter_repo, run_id=run_id, token=self.hf_token))
+        except Exception as exc:
+            report["hub_error"] = _redact(f"{type(exc).__name__}: {exc}", self.hf_token)
+        with self.persist_lock:
+            for version in sorted(remote or ()):
+                if version > current:
+                    report["hub_ahead"].append(version)
+                elif version > 0:
+                    key = f"{version:06d}"
+                    self.hub_push_versions.setdefault(key, {
+                        "enabled": True, "status": "uploaded", "repo_id": self.hf_adapter_repo,
+                        "path_in_repo": f"checkpoints/{run_id}/theta-{key}",
+                        "theta_version": version, "source": "found_on_hub",
+                    })
+                    report["found_on_hub"].append(version)
+            queue_root = self.run_dir / "hub_push_queue"
+            entries = sorted(queue_root.iterdir()) if queue_root.is_dir() else []
+            for entry in entries:
+                match = _QUEUE_ENTRY.match(entry.name)
+                if not match or not entry.is_dir():
+                    continue
+                version = int(match.group(1))
+                key = f"{version:06d}"
+                verdict, metadata = self._queue_entry_verdict(entry, version, current)
+                if verdict == "ignore":
+                    report["ignored"].append(entry.name)
+                elif verdict == "drop":
+                    shutil.rmtree(entry, ignore_errors=True)
+                    report["dropped"].append(entry.name)
+                elif remote is not None and version in remote:
+                    shutil.rmtree(entry, ignore_errors=True)  # already uploaded
+                else:
+                    path_in_repo = f"checkpoints/{run_id}/theta-{key}"
+                    queued = {
+                        "enabled": True, "status": "queued", "repo_id": self.hf_adapter_repo,
+                        "path_in_repo": path_in_repo, "theta_version": version,
+                        "theta_hash": metadata["theta_hash"], "source": "replayed_after_restart",
+                    }
+                    self.hub_push_versions[key] = queued
+                    self.hub_push_queue.put((key, entry, metadata, path_in_repo))
+                    report["replayed"].append(version)
+            if self.hub_push_versions:
+                latest = max(self.hub_push_versions, key=int)
+                self.hub_push_status = self.hub_push_versions[latest]
+            self._write_hub_status_locked()
+            key = f"{current:06d}"
+            if current > 0 and current % self.hf_push_every_steps == 0 and key not in self.hub_push_versions:
+                report["pushed_resumed_version"] = current
+                self.start_hub_push()
+        return report
 
     def start_hub_push(self, *, final: bool = False, force: bool = False) -> dict:
         """Queue a versioned adapter snapshot when due, without blocking workers."""
@@ -431,7 +597,9 @@ class Application:
                 shutil.copy2(self.run_dir / "adapter_model.safetensors", snapshot_dir / "adapter_model.safetensors")
                 metadata = {
                     "run_id": self.coordinator.run_id,
-                    "round_id": self.coordinator.round_id,
+                    # The round that produced this version; the open round's id is one more
+                    # whenever the push happens after the next round has opened.
+                    "round_id": step,
                     "theta_version": step,
                     "theta_hash": self.coordinator.theta_hash,
                     "base": self.coordinator.base,
@@ -741,7 +909,8 @@ def make_handler(app: Application):
                 if len(payload) != size:
                     raise ProtocolError("truncated_payload", "request body shorter than Content-Length", 400)
                 result = app.coordinator.submit_result(metadata, payload)
-                app.persist_result_payload(str(metadata["unit_id"]), payload)
+                app.persist_result_payload(str(metadata["unit_id"]), payload,
+                                           round_id=int(metadata["round_id"]))
                 if result["round_closed"]:
                     app.persist_checkpoint()
                     final_step = app.round_index == len(app.round_plan) - 1
@@ -818,6 +987,10 @@ def main() -> None:
                              "verifies. Work in flight in the interrupted round is discarded and "
                              "the round restarts; data, plan, model and optimizer settings must "
                              "match the original launch")
+    parser.add_argument("--keep-gradient-rounds", type=int, default=-1,
+                        help="closed rounds whose per-unit gradient files under gradients/ are kept "
+                             "(the open round's always are); older ones are deleted. Each file is "
+                             "about 12 MiB. -1 keeps everything")
     parser.add_argument("--keep-checkpoints", type=int, default=3,
                         help="resume checkpoints to keep under <run-dir>/ckpt (newest first)")
     args = parser.parse_args()
@@ -831,6 +1004,8 @@ def main() -> None:
         parser.error("--hf-push-every-steps must be positive")
     if args.keep_checkpoints < 1:
         parser.error("--keep-checkpoints must be at least 1")
+    if args.keep_gradient_rounds < -1:
+        parser.error("--keep-gradient-rounds must be -1 (keep all) or a count of rounds, 0 or more")
     if args.resume and args.resume_from_hf:
         parser.error("--resume and --resume-from-hf are alternatives; pick one source")
     if args.resume_from_hf and not (args.hf_adapter_repo and args.hf_run_id):
@@ -933,8 +1108,24 @@ def main() -> None:
         start_round_index=start_index,
         checkpoint_keep=args.keep_checkpoints,
         round_plan_sha256=plan_sha256,
+        keep_gradient_rounds=args.keep_gradient_rounds,
     )
+    if loaded is not None:
+        aside = app.set_aside_in_flight_gradients()
+        if aside is not None:
+            print(f"Set aside the interrupted round's gradient files: {aside.name}", flush=True)
     app.persist_checkpoint()  # commits version 0 of a fresh run; logs a resume event
+    if loaded is not None and args.push_adapter_to_hf:
+        print("Reconciling Hub pushes with the resumed run...", flush=True)
+        recovery = app.recover_hub_pushes()
+        print(json.dumps({"hub_push_recovery": recovery}, ensure_ascii=False), flush=True)
+        if recovery["hub_error"]:
+            print("WARNING: could not list the Hub repository; pending pushes will be sent without "
+                  "checking what it already holds.", flush=True)
+        if recovery["hub_ahead"]:
+            print(f"WARNING: the Hub already holds newer versions of this run "
+                  f"({recovery['hub_ahead']}) than the one resumed from. Reaching those versions "
+                  f"again will overwrite their folders.", flush=True)
     server = ThreadingHTTPServer((args.bind, args.port), make_handler(app))
     print(json.dumps({
         "listen": f"http://{args.bind}:{args.port}",
@@ -954,6 +1145,7 @@ def main() -> None:
         "epochs": args.epochs,
         "units_per_step": args.units_per_step or len(manifest["units"]),
         "hf_push_every_steps": args.hf_push_every_steps,
+        "keep_gradient_rounds": args.keep_gradient_rounds,
         "min_units": coordinator.min_units,
         "worker_code_sha256": worker_hash,
         "data_manifest_sha256": manifest["manifest_sha256"],

@@ -213,6 +213,67 @@ class CoordinatorCommandLineTests(unittest.TestCase):
                 self.assertIn(expected, self.refused(run_dir, *extra))
         self.assertFalse(run_dir.exists(), "rejected options must not create a run directory")
 
+    def test_resume_reconciles_hub_pushes_and_sets_aside_the_interrupted_rounds_gradients(self):
+        run_dir = self.root / "run"
+        push = ["--push-adapter-to-hf", "--hf-adapter-repo", "u/a", "--hf-token", "write"]
+        self.run_main(run_dir, *push)
+        leftover = run_dir / "gradients" / "round-000001"
+        leftover.mkdir(parents=True)
+        (leftover / "x.safetensors").write_bytes(b"from before the crash")
+
+        calls = []
+
+        def listing(**kwargs):
+            calls.append(kwargs)
+            return []
+
+        with patch.object(coordinator_module, "list_hub_checkpoint_versions", listing):
+            status, printed = self.run_main(run_dir, "--resume", *push)
+
+        self.assertEqual(calls[0]["repo_id"], "u/a")
+        self.assertEqual(calls[0]["run_id"], status["run_id"])
+        self.assertIn("hub_push_recovery", printed)
+        self.assertIn("Set aside the interrupted round's gradient files", printed)
+        self.assertFalse(leftover.exists())
+        self.assertEqual(len(list((run_dir / "gradients").glob("round-000001.discarded-*"))), 1)
+        self.assertNotIn("WARNING", printed)
+
+    def test_resume_warns_when_the_hub_is_ahead_or_unreachable(self):
+        run_dir = self.root / "run"
+        push = ["--push-adapter-to-hf", "--hf-adapter-repo", "u/a", "--hf-token", "write"]
+        self.run_main(run_dir, *push)
+
+        with patch.object(coordinator_module, "list_hub_checkpoint_versions", lambda **kw: [7]):
+            _, printed = self.run_main(run_dir, "--resume", *push)
+        self.assertIn("already holds newer versions", printed)
+        self.assertIn("[7]", printed)
+
+        def unreachable(**kwargs):
+            raise ConnectionError("offline")
+
+        with patch.object(coordinator_module, "list_hub_checkpoint_versions", unreachable):
+            _, printed = self.run_main(run_dir, "--resume", *push)
+        self.assertIn("could not list the Hub repository", printed)
+
+    def test_resume_without_hub_pushing_never_contacts_the_hub(self):
+        run_dir = self.root / "run"
+        self.run_main(run_dir)
+
+        def forbidden(**kwargs):
+            raise AssertionError("the Hub must not be contacted")
+
+        with patch.object(coordinator_module, "list_hub_checkpoint_versions", forbidden):
+            status, printed = self.run_main(run_dir, "--resume")
+        self.assertTrue(status["resumed"])
+        self.assertNotIn("hub_push_recovery", printed)
+
+    def test_gradient_retention_option_is_validated_and_reported(self):
+        self.assertIn("--keep-gradient-rounds", self.refused(self.root / "bad", "--keep-gradient-rounds", "-2"))
+        status, _ = self.run_main(self.root / "ok", "--keep-gradient-rounds", "2")
+        self.assertEqual(status["keep_gradient_rounds"], 2)
+        status, _ = self.run_main(self.root / "default")
+        self.assertEqual(status["keep_gradient_rounds"], -1)
+
     def test_unknown_optimizer_policy_is_rejected_by_the_parser(self):
         self.assertIn("invalid choice", self.refused(self.root / "run", "--hf-push-optimizer", "maybe"))
 
