@@ -19,9 +19,18 @@ from urllib.parse import parse_qs, urlparse
 import torch
 from safetensors.torch import load_file, save_file
 
+from rwkv_dist_checkpoint import (
+    LoadedCheckpoint,
+    ResumeError,
+    check_resume_compatibility,
+    list_checkpoint_versions,
+    load_latest_checkpoint,
+    write_checkpoint,
+)
 from rwkv_dist_protocol import (
     ProtocolError,
     RoundCoordinator,
+    adamw_hyperparameters,
     canonical_json,
     decode_tensors,
     encode_tensors,
@@ -106,6 +115,98 @@ def load_initial_theta(adapter_dir: Path) -> dict[str, torch.Tensor]:
     return theta
 
 
+def round_plan_digest(plan: list[dict]) -> str:
+    """Identify a training schedule by its steps, unit contents and token budgets.
+
+    A checkpoint's version number only means something against the same plan,
+    so resume refuses a checkpoint whose digest differs from this launch's.
+    """
+    return sha256_bytes(canonical_json([
+        {
+            "unit_ids": [unit["unit_id"] for unit in step["units"]],
+            "unit_sha256": [unit["unit_sha256"] for unit in step["units"]],
+            "target_loss_tokens": step["target_loss_tokens"],
+            "min_units": step["min_units"],
+        }
+        for step in plan
+    ]))
+
+
+def build_coordinator(
+    *,
+    round_plan: list[dict],
+    plan_sha256: str,
+    manifest: dict,
+    base: dict,
+    worker_code_sha256: str,
+    lease_seconds: float,
+    learning_rate: float,
+    new_run_id: str,
+    initial_theta: dict[str, torch.Tensor] | None = None,
+    loaded: LoadedCheckpoint | None = None,
+) -> tuple[RoundCoordinator, int]:
+    """Create the coordinator for a fresh run, or for the round after `loaded`.
+
+    Returns the coordinator and the plan index of the round it opens. Whatever
+    was in flight when the checkpoint was written is not restored: that round
+    opens again with every unit pending, and results workers still hold for it
+    are refused as belonging to unknown leases.
+    """
+    if loaded is None:
+        if initial_theta is None:
+            raise ValueError("a fresh run needs an initial theta")
+        start, theta, run_id, optimizer_tensors = 0, initial_theta, new_run_id, None
+    else:
+        check_resume_compatibility(loaded.state, {
+            "data_manifest_sha256": manifest["manifest_sha256"],
+            "round_plan_sha256": plan_sha256,
+            "planned_rounds": len(round_plan),
+            "base": base,
+            "tokenizer": manifest["tokenizer"],
+            "hyperparameters": adamw_hyperparameters(learning_rate),
+        })
+        start = int(loaded.state["theta_version"])
+        if start >= len(round_plan):
+            raise ResumeError(
+                f"checkpoint is at version {start} of {len(round_plan)} planned steps; "
+                "this run has already finished"
+            )
+        theta = loaded.theta
+        run_id = loaded.state["run_id"]
+        optimizer_tensors = loaded.optimizer_tensors
+    step = round_plan[start]
+    coordinator = RoundCoordinator(
+        theta=theta,
+        units=step["units"],
+        run_id=run_id,
+        base=base,
+        tokenizer=manifest["tokenizer"],
+        worker_code_sha256=worker_code_sha256,
+        target_loss_tokens=step["target_loss_tokens"],
+        min_units=step["min_units"],
+        lease_seconds=lease_seconds,
+        learning_rate=learning_rate,
+        weight_decay=0.0,
+        global_grad_clip=None,
+        theta_version=start,
+        optimizer_tensors=optimizer_tensors,
+    )
+    if loaded is not None:
+        if coordinator.theta_hash != loaded.state["theta_hash"]:
+            raise ResumeError("restored adapter does not reproduce the checkpoint's theta hash")
+        coordinator.events.append({
+            "event": "coordinator_resumed",
+            "run_id": run_id,
+            "from_theta_version": start,
+            "resumed_round_id": coordinator.round_id,
+            "optimizer_restored": bool(loaded.optimizer_tensors),
+            "in_flight_round_discarded": True,
+            "skipped_checkpoints": list(loaded.skipped),
+            "at": time.time(),
+        })
+    return coordinator, start
+
+
 def _with_status(previous: dict, status: str) -> dict:
     """Copy a hub-push record to a new status, dropping the earlier failure's error.
 
@@ -122,7 +223,10 @@ class Application:
                  hf_adapter_repo: str | None = None, hf_token: str | None = None,
                  hf_adapter_private: bool = True,
                  round_plan: list[dict] | None = None,
-                 hf_push_every_steps: int = 10):
+                 hf_push_every_steps: int = 10,
+                 start_round_index: int = 0,
+                 checkpoint_keep: int = 3,
+                 round_plan_sha256: str | None = None):
         self.coordinator = coordinator
         self.token = token
         self.run_dir = run_dir
@@ -138,7 +242,9 @@ class Application:
             "target_loss_tokens": coordinator.target_loss_tokens,
             "min_units": coordinator.min_units,
         }]
-        self.round_index = 0
+        self.round_index = start_round_index
+        self.checkpoint_keep = int(checkpoint_keep)
+        self.round_plan_sha256 = round_plan_sha256 or round_plan_digest(self.round_plan)
         self.hub_push_versions: dict[str, dict] = {}
         self.hub_push_status = {
             "enabled": hf_adapter_repo is not None,
@@ -175,8 +281,30 @@ class Application:
         temp.write_bytes(payload)
         temp.replace(path)
 
+    def save_resume_checkpoint(self) -> None:
+        """Commit the current adapter version for --resume (a no-op if already saved)."""
+        theta, optimizer_tensors, version, theta_hash = self.coordinator.export_state()
+        write_checkpoint(
+            self.run_dir / "ckpt",
+            state={
+                "run_id": self.coordinator.run_id,
+                "theta_version": version,
+                "theta_hash": theta_hash,
+                "planned_rounds": len(self.round_plan),
+                "round_plan_sha256": self.round_plan_sha256,
+                "data_manifest_sha256": self.manifest["manifest_sha256"],
+                "base": self.coordinator.base,
+                "tokenizer": self.coordinator.tokenizer,
+                "hyperparameters": self.coordinator.hyperparameters(),
+            },
+            theta=theta,
+            optimizer_tensors=optimizer_tensors,
+            keep=self.checkpoint_keep,
+        )
+
     def persist_checkpoint(self) -> None:
         with self.persist_lock:
+            self.save_resume_checkpoint()
             state = {parameter_name_to_peft_saved_name(k): v for k, v in self.coordinator.theta.items()}
             adapter_path = self.run_dir / "adapter_model.safetensors"
             temp = self.run_dir / "adapter_model.tmp"
@@ -603,6 +731,13 @@ def main() -> None:
                         help="push every N optimizer updates and always push the final adapter")
     parser.add_argument("--manual-training-complete", action="store_true",
                         help="wait for POST /training-complete after the final round")
+    parser.add_argument("--resume", action="store_true",
+                        help="continue the run in --run-dir from its newest checkpoint that "
+                             "verifies. Work in flight in the interrupted round is discarded and "
+                             "the round restarts; data, plan, model and optimizer settings must "
+                             "match the original launch")
+    parser.add_argument("--keep-checkpoints", type=int, default=3,
+                        help="resume checkpoints to keep under <run-dir>/ckpt (newest first)")
     args = parser.parse_args()
     if not args.token:
         parser.error("set --token or RWKV_PROTOCOL_TOKEN")
@@ -612,6 +747,8 @@ def main() -> None:
         parser.error("epochs/minimum units must be positive and units-per-step cannot be negative")
     if args.hf_push_every_steps <= 0:
         parser.error("--hf-push-every-steps must be positive")
+    if args.keep_checkpoints < 1:
+        parser.error("--keep-checkpoints must be at least 1")
     if args.push_adapter_to_hf and not args.hf_adapter_repo:
         parser.error("--push-adapter-to-hf requires --hf-adapter-repo")
     if args.push_adapter_to_hf and not args.hf_token:
@@ -635,34 +772,44 @@ def main() -> None:
     base_manifest = json.loads(release_manifest_path.read_text())
     if manifest["model"]["release_manifest_sha256"] != sha256_bytes(release_manifest_path.read_bytes()):
         raise ValueError("local base model manifest does not match the tokenized data shard")
-    theta = load_initial_theta(args.initial_adapter_dir)
     round_plan = build_round_plan(
         manifest["units"], epochs=args.epochs, units_per_step=args.units_per_step,
         min_units_per_step=args.min_units_per_step,
     )
-    first_step = round_plan[0]
-    target_tokens = first_step["target_loss_tokens"]
+    plan_sha256 = round_plan_digest(round_plan)
+    checkpoint_root = args.run_dir / "ckpt"
+    loaded = None
+    if args.resume:
+        try:
+            loaded = load_latest_checkpoint(checkpoint_root)
+        except ResumeError as exc:
+            parser.error(f"cannot resume: {exc}")
+        for problem in loaded.skipped:
+            print(f"WARNING: skipped an unusable newer checkpoint: {problem}", flush=True)
+    elif list_checkpoint_versions(checkpoint_root):
+        parser.error(
+            f"{checkpoint_root} already holds checkpoints; pass --resume to continue "
+            "that run or choose a new --run-dir"
+        )
     worker_hash = worker_bundle_sha256(Path(__file__).parent)
-    coordinator = RoundCoordinator(
-        theta=theta,
-        units=first_step["units"],
-        run_id=f"g1j1.5b-{int(time.time())}",
-        base={
-            "repo": MODEL_ID,
-            "revision": MODEL_REVISION,
-            "release_manifest_sha256": manifest["model"]["release_manifest_sha256"],
-            "serialized_parameter_count": base_manifest["conversion"]["serialized_parameter_count"],
-            "dtype": "bfloat16",
-        },
-        tokenizer=manifest["tokenizer"],
-        worker_code_sha256=worker_hash,
-        target_loss_tokens=target_tokens,
-        min_units=first_step["min_units"],
-        lease_seconds=args.lease_seconds,
-        learning_rate=args.learning_rate,
-        weight_decay=0.0,
-        global_grad_clip=None,
-    )
+    base = {
+        "repo": MODEL_ID,
+        "revision": MODEL_REVISION,
+        "release_manifest_sha256": manifest["model"]["release_manifest_sha256"],
+        "serialized_parameter_count": base_manifest["conversion"]["serialized_parameter_count"],
+        "dtype": "bfloat16",
+    }
+    try:
+        coordinator, start_index = build_coordinator(
+            round_plan=round_plan, plan_sha256=plan_sha256, manifest=manifest, base=base,
+            worker_code_sha256=worker_hash, lease_seconds=args.lease_seconds,
+            learning_rate=args.learning_rate, new_run_id=f"g1j1.5b-{int(time.time())}",
+            initial_theta=None if loaded else load_initial_theta(args.initial_adapter_dir),
+            loaded=loaded,
+        )
+    except ResumeError as exc:
+        parser.error(f"cannot resume: {exc}")
+    target_tokens = round_plan[start_index]["target_loss_tokens"]
     app = Application(
         coordinator, token=args.token, run_dir=args.run_dir,
         adapter_config_dir=args.initial_adapter_dir, manifest=manifest,
@@ -672,7 +819,11 @@ def main() -> None:
         hf_adapter_private=not args.hf_adapter_public,
         round_plan=round_plan,
         hf_push_every_steps=args.hf_push_every_steps,
+        start_round_index=start_index,
+        checkpoint_keep=args.keep_checkpoints,
+        round_plan_sha256=plan_sha256,
     )
+    app.persist_checkpoint()  # commits version 0 of a fresh run; logs a resume event
     server = ThreadingHTTPServer((args.bind, args.port), make_handler(app))
     print(json.dumps({
         "listen": f"http://{args.bind}:{args.port}",
@@ -684,6 +835,8 @@ def main() -> None:
         "run_id": coordinator.run_id,
         "round_id": coordinator.round_id,
         "theta_hash": coordinator.theta_hash,
+        "resumed": loaded is not None,
+        "optimizer_restored": bool(loaded and loaded.optimizer_tensors),
         "target_loss_tokens": target_tokens,
         "planned_optimizer_steps": len(round_plan),
         "epochs": args.epochs,

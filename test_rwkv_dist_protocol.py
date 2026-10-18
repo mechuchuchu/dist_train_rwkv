@@ -9,8 +9,10 @@ import torch
 from rwkv_dist_protocol import (
     ProtocolError,
     RoundCoordinator,
+    adamw_hyperparameters,
     decode_tensors,
     encode_tensors,
+    load_optimizer_state_tensors,
     sha256_bytes,
     tensor_map_sha256,
     unit_digest,
@@ -212,6 +214,129 @@ class RoundCoordinatorTests(unittest.TestCase):
         late_lease = self.coordinator.lease("worker-late")
         self.assertEqual(late_lease["round_id"], 2)
         self.assertEqual(late_lease["theta_hash"], descriptor["theta_hash"])
+
+
+class OptimizerResumeTests(unittest.TestCase):
+    ROUND1 = [("r1-u0", 2), ("r1-u1", 6)]
+    ROUND2 = [("r2-u0", 2), ("r2-u1", 6)]
+
+    def units(self, spec):
+        return [make_unit(unit_id, tokens) for unit_id, tokens in spec]
+
+    def make(self, spec, *, theta=None, theta_version=0, optimizer_tensors=None):
+        units = self.units(spec)
+        coordinator = RoundCoordinator(
+            theta=theta or {"lora_A": torch.zeros(2), "lora_B": torch.zeros(1)},
+            units=units,
+            run_id="resume-test",
+            base={"revision": "pinned"},
+            tokenizer={"hash": "pinned"},
+            worker_code_sha256="worker-code",
+            target_loss_tokens=sum(tokens for _, tokens in spec),
+            min_units=len(units),
+            lease_seconds=30,
+            learning_rate=1e-2,
+            theta_version=theta_version,
+            optimizer_tensors=optimizer_tensors,
+        )
+        coordinator.join("worker-0")
+        return coordinator
+
+    def close_round(self, coordinator, value):
+        while True:
+            lease = coordinator.lease("worker-0")
+            payload = encode_tensors({
+                "lora_A": torch.full((2,), float(value)),
+                "lora_B": torch.full((1,), float(value)),
+            })
+            result = coordinator.submit_result(make_metadata(lease, lease["unit"], payload), payload)
+            if result["round_closed"]:
+                return
+
+    def test_resuming_from_exported_state_matches_an_uninterrupted_run(self):
+        continuous = self.make(self.ROUND1)
+        self.close_round(continuous, 1.0)
+        continuous.start_next_round(self.units(self.ROUND2), target_loss_tokens=8, min_units=2)
+        self.close_round(continuous, -0.5)
+
+        interrupted = self.make(self.ROUND1)
+        self.close_round(interrupted, 1.0)
+        theta, optimizer_tensors, version, theta_hash = interrupted.export_state()
+        self.assertEqual(version, 1)
+
+        resumed = self.make(self.ROUND2, theta=theta, theta_version=version,
+                            optimizer_tensors=optimizer_tensors)
+        self.assertEqual((resumed.round_id, resumed.theta_version), (2, 1))
+        self.assertEqual(resumed.theta_hash, theta_hash)
+        self.close_round(resumed, -0.5)
+
+        self.assertEqual(resumed.theta_version, continuous.theta_version)
+        for name, value in continuous.theta.items():
+            self.assertTrue(torch.equal(resumed.theta[name], value), name)
+        self.assertEqual(resumed.theta_hash, continuous.theta_hash)
+
+    def test_dropping_the_adam_moments_changes_the_next_update(self):
+        continuous = self.make(self.ROUND1)
+        self.close_round(continuous, 1.0)
+        continuous.start_next_round(self.units(self.ROUND2), target_loss_tokens=8, min_units=2)
+        self.close_round(continuous, -0.5)
+
+        interrupted = self.make(self.ROUND1)
+        self.close_round(interrupted, 1.0)
+        theta, _, version, _ = interrupted.export_state()
+        cold = self.make(self.ROUND2, theta=theta, theta_version=version)
+        self.close_round(cold, -0.5)
+
+        self.assertNotEqual(cold.theta_hash, continuous.theta_hash)
+
+    def test_export_has_no_optimizer_state_before_the_first_step(self):
+        fresh = self.make(self.ROUND1)
+        theta, optimizer_tensors, version, theta_hash = fresh.export_state()
+        self.assertEqual((optimizer_tensors, version), ({}, 0))
+        self.assertEqual(theta_hash, fresh.theta_hash)
+
+    def test_export_names_every_moment_for_every_parameter(self):
+        coordinator = self.make(self.ROUND1)
+        self.close_round(coordinator, 1.0)
+        _, optimizer_tensors, _, _ = coordinator.export_state()
+        self.assertEqual(set(optimizer_tensors), {
+            f"{key}/{name}"
+            for key in ("exp_avg", "exp_avg_sq", "step")
+            for name in ("lora_A", "lora_B")
+        })
+        self.assertEqual(optimizer_tensors["step/lora_A"].shape, torch.Size([]))
+
+    def test_hyperparameters_match_the_helper_used_before_construction(self):
+        coordinator = self.make(self.ROUND1)
+        self.assertEqual(coordinator.hyperparameters(), adamw_hyperparameters(1e-2))
+        self.assertNotEqual(coordinator.hyperparameters(), adamw_hyperparameters(2e-2))
+
+    def test_invalid_optimizer_state_is_rejected(self):
+        parameters = {"a": torch.nn.Parameter(torch.zeros(2)), "b": torch.nn.Parameter(torch.zeros(1))}
+
+        def fresh_optimizer():
+            return torch.optim.AdamW(list(parameters.values()), lr=1e-2)
+
+        def full(name, shape):
+            return {
+                f"exp_avg/{name}": torch.zeros(shape),
+                f"exp_avg_sq/{name}": torch.zeros(shape),
+                f"step/{name}": torch.tensor(1.0),
+            }
+
+        with self.assertRaisesRegex(ValueError, "unexpected"):
+            load_optimizer_state_tensors(fresh_optimizer(), parameters, {"exp_avg/zzz": torch.zeros(1)})
+        with self.assertRaisesRegex(ValueError, "incomplete"):
+            load_optimizer_state_tensors(fresh_optimizer(), parameters, {"exp_avg/a": torch.zeros(2)})
+        with self.assertRaisesRegex(ValueError, "shape mismatch"):
+            load_optimizer_state_tensors(fresh_optimizer(), parameters, {**full("a", (3,)), **full("b", (1,))})
+        with self.assertRaisesRegex(ValueError, "only some"):
+            load_optimizer_state_tensors(fresh_optimizer(), parameters, full("a", (2,)))
+        load_optimizer_state_tensors(fresh_optimizer(), parameters, {})  # empty is a no-op
+
+    def test_negative_theta_version_is_rejected(self):
+        with self.assertRaises(ValueError):
+            self.make(self.ROUND1, theta_version=-1)
 
 
 if __name__ == "__main__":

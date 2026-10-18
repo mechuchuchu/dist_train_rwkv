@@ -67,6 +67,89 @@ def decode_tensors(payload: bytes) -> dict[str, torch.Tensor]:
     return load_safetensors(payload)
 
 
+OPTIMIZER_STATE_KEYS = ("exp_avg", "exp_avg_sq", "step")
+
+
+def optimizer_hyperparameters(optimizer: torch.optim.Optimizer) -> dict[str, Any]:
+    """JSON-safe AdamW settings that must match for saved moments to stay valid."""
+    group = optimizer.param_groups[0]
+    return {
+        "lr": float(group["lr"]),
+        "betas": [float(value) for value in group["betas"]],
+        "eps": float(group["eps"]),
+        "weight_decay": float(group["weight_decay"]),
+        "amsgrad": bool(group["amsgrad"]),
+    }
+
+
+def adamw_hyperparameters(learning_rate: float, weight_decay: float = 0.0) -> dict[str, Any]:
+    """The settings RoundCoordinator's optimizer will have for these arguments."""
+    probe = torch.nn.Parameter(torch.zeros(1))
+    return optimizer_hyperparameters(
+        torch.optim.AdamW([probe], lr=learning_rate, weight_decay=weight_decay)
+    )
+
+
+def optimizer_state_tensors(
+    optimizer: torch.optim.Optimizer, params: dict[str, torch.nn.Parameter]
+) -> dict[str, torch.Tensor]:
+    """Flatten per-parameter AdamW state into named CPU tensors.
+
+    Plain tensors rather than a pickled state_dict, so the result can be kept
+    as safetensors and loaded from an untrusted location without running code.
+    """
+    tensors: dict[str, torch.Tensor] = {}
+    for name, parameter in params.items():
+        state = optimizer.state.get(parameter)
+        if not state:
+            continue
+        missing = [key for key in OPTIMIZER_STATE_KEYS if key not in state]
+        if missing:
+            raise ValueError(f"unsupported optimizer state for {name}: missing {missing}")
+        for key in OPTIMIZER_STATE_KEYS:
+            tensors[f"{key}/{name}"] = (
+                torch.as_tensor(state[key]).detach().to("cpu", torch.float32).contiguous().clone()
+            )
+    return tensors
+
+
+def load_optimizer_state_tensors(
+    optimizer: torch.optim.Optimizer,
+    params: dict[str, torch.nn.Parameter],
+    tensors: dict[str, torch.Tensor],
+) -> None:
+    """Install optimizer_state_tensors() output into a freshly built optimizer.
+
+    Hyperparameters stay as the optimizer was constructed; callers compare them
+    with the saved ones beforehand. An empty map (nothing stepped yet) is a no-op.
+    """
+    names = list(params)
+    known = set(names)
+    for tensor_name in tensors:
+        key, _, name = tensor_name.partition("/")
+        if key not in OPTIMIZER_STATE_KEYS or name not in known:
+            raise ValueError(f"unexpected optimizer state tensor {tensor_name!r}")
+    state: dict[int, dict[str, torch.Tensor]] = {}
+    for index, name in enumerate(names):
+        present = [key for key in OPTIMIZER_STATE_KEYS if f"{key}/{name}" in tensors]
+        if not present:
+            continue
+        if len(present) != len(OPTIMIZER_STATE_KEYS):
+            raise ValueError(f"incomplete optimizer state for {name}")
+        for key in ("exp_avg", "exp_avg_sq"):
+            if tuple(tensors[f"{key}/{name}"].shape) != tuple(params[name].shape):
+                raise ValueError(f"optimizer {key} shape mismatch for {name}")
+        state[index] = {key: tensors[f"{key}/{name}"].clone() for key in OPTIMIZER_STATE_KEYS}
+    if not state:
+        return
+    if len(state) != len(names):
+        raise ValueError("optimizer state covers only some trainable tensors")
+    optimizer.load_state_dict({
+        "state": state,
+        "param_groups": optimizer.state_dict()["param_groups"],
+    })
+
+
 class ProtocolError(Exception):
     def __init__(self, code: str, message: str, status: int = 400):
         super().__init__(message)
@@ -103,15 +186,23 @@ class RoundCoordinator:
         learning_rate: float,
         weight_decay: float = 0.0,
         global_grad_clip: float | None = None,
+        theta_version: int = 0,
+        optimizer_tensors: dict[str, torch.Tensor] | None = None,
     ):
+        """`theta_version` and `optimizer_tensors` resume from a saved adapter
+        version: the round opened is then round `theta_version + 1`, and the
+        AdamW moments continue from `optimizer_tensors` instead of starting cold.
+        """
         if not theta:
             raise ValueError("theta must contain trainable tensors")
+        if theta_version < 0:
+            raise ValueError("theta_version cannot be negative")
         if not units:
             raise ValueError("at least one work unit is required")
         self.lock = threading.RLock()
         self.run_id = run_id
-        self.round_id = 1
-        self.theta_version = 0
+        self.round_id = theta_version + 1
+        self.theta_version = theta_version
         self.theta = {k: v.detach().to("cpu", torch.float32).contiguous().clone() for k, v in theta.items()}
         self.expected = {k: tuple(v.shape) for k, v in self.theta.items()}
         self.theta_hash = tensor_map_sha256(self.theta)
@@ -126,6 +217,8 @@ class RoundCoordinator:
         self.optimizer = torch.optim.AdamW(
             list(self.params.values()), lr=learning_rate, weight_decay=weight_decay
         )
+        if optimizer_tensors:
+            load_optimizer_state_tensors(self.optimizer, self.params, optimizer_tensors)
         self.units: dict[str, dict[str, Any]] = {}
         for supplied in units:
             unit = dict(supplied)
@@ -260,6 +353,23 @@ class RoundCoordinator:
     def snapshot_bytes(self) -> bytes:
         with self.lock:
             return encode_tensors(self.theta)
+
+    def hyperparameters(self) -> dict[str, Any]:
+        with self.lock:
+            return optimizer_hyperparameters(self.optimizer)
+
+    def export_state(
+        self,
+    ) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor], int, str]:
+        """Return (theta, optimizer tensors, version, hash) captured under one lock."""
+        with self.lock:
+            theta = {name: value.clone() for name, value in self.theta.items()}
+            return (
+                theta,
+                optimizer_state_tensors(self.optimizer, self.params),
+                self.theta_version,
+                self.theta_hash,
+            )
 
     def snapshot(self) -> tuple[bytes, str, int]:
         """Return adapter bytes with the theta hash/version they encode.

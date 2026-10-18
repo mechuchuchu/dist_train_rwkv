@@ -359,8 +359,11 @@ def main() -> None:
             )
         except CoordinatorHTTPError as exc:
             error_code = exc.detail.get("error") if isinstance(exc.detail, dict) else None
+            # duplicate_unit: the unit was credited to someone else first, which
+            # happens when a restarted coordinator reissues the round while this
+            # worker was still computing under a pre-restart lease.
             if exc.status == 409 and error_code in {
-                "unknown_lease", "expired_lease", "round_closed"
+                "unknown_lease", "expired_lease", "round_closed", "duplicate_unit"
             }:
                 print(json.dumps({"status": "result_discarded_lease_lost",
                                   "unit_id": unit["unit_id"],

@@ -220,6 +220,43 @@ class WorkerStaleLeaseTests(unittest.TestCase):
         self.assertNotIn("/release", coordinator.calls)
         self.assertNotIn("/result", coordinator.calls)
 
+    def test_result_for_a_unit_another_worker_already_finished_is_discarded_not_fatal(self):
+        # After a coordinator restart the round is reissued from its first unit,
+        # so a worker still holding a lease from before the restart can finish a
+        # unit that someone else has already been credited for.
+        for code in ("duplicate_unit", "unknown_lease", "expired_lease", "round_closed"):
+            with self.subTest(code=code):
+                coordinator = ScriptedCoordinator(
+                    routes={
+                        "/round": [round_descriptor(T0, 0)] * 4,
+                        "/lease": [leased(T0, 0, "lease-lost"), leased(T0, 0, "lease-next")],
+                        "/snapshot": [snapshot_reply(T0)],
+                        "/result": [CoordinatorHTTPError(409, {"error": code}),
+                                    self.accepted_result(T0)],
+                    },
+                    sticky={"/join": {"status": "active"}},
+                )
+
+                output, _ = self.run_worker(coordinator)
+
+                self.assertIn('"status": "result_discarded_lease_lost"', output)
+                self.assertIn(f'"error": "{code}"', output)
+                self.assertEqual(coordinator.calls.count("/result"), 2)
+
+    def test_other_rejections_of_a_result_stay_fatal(self):
+        coordinator = ScriptedCoordinator(
+            routes={
+                "/round": [round_descriptor(T0, 0)] * 2,
+                "/lease": [leased(T0, 0, "lease-1")],
+                "/snapshot": [snapshot_reply(T0)],
+                "/result": [CoordinatorHTTPError(403, {"error": "worker_code_mismatch"})],
+            },
+            sticky={"/join": {"status": "active"}},
+        )
+
+        with self.assertRaises(CoordinatorHTTPError):
+            self.run_worker(coordinator)
+
     def test_up_to_date_lease_is_unaffected(self):
         coordinator = ScriptedCoordinator(
             routes={
