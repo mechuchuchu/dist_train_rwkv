@@ -2,7 +2,18 @@
 
 2026-10-18
 
-이 문서는 13.3B RWKV-7을 frozen base로 두고 LoRA와 추가 special token의 embedding/lm-head 행을 분산 SFT하는 설계다. lease, token budget, canary, audit, rollback 등 coordinator protocol은 [`Distributed_Soft_Prompt_SFT_Design_Doc.md`](Distributed_Soft_Prompt_SFT_Design_Doc.md)를 재사용한다. State tuning과의 비교는 [`Distributed_RWKV_State_Tuning_Design.md`](Distributed_RWKV_State_Tuning_Design.md)를 참고한다.
+이 문서는 7B, 13.3B 등 RWKV-7 checkpoint 크기를 선택해 frozen base에 LoRA/QLoRA와 추가 special-token embedding/lm-head 행을 학습하는 분산 SFT 설계다. Coordinator protocol은 [`Distributed_Soft_Prompt_SFT_Design_Doc.md`](Distributed_Soft_Prompt_SFT_Design_Doc.md)를 재사용하고, 각 worker 설정은 선택한 checkpoint의 실제 tensor shape에서 생성한다. State tuning 설계는 [`Distributed_RWKV_State_Tuning_Design.md`](Distributed_RWKV_State_Tuning_Design.md)를 참고한다.
+
+현재 RTX 3060에서 지정 13.3B와 7.2B checkpoint의 full-model QLoRA 결과는 [`VRAM_Baseline_2026-10-18.md`](VRAM_Baseline_2026-10-18.md)에 기록했다. FP32 master LoRA 기준 13.3B all-linear rank-8은 2,048 tokens/step까지 통과하고 3,072에서 OOM, 7.2B는 4,096 tokens/step 조합까지 통과했다. 13.3B의 2,048은 peak reserved 여유가 약 0.64 GiB뿐이므로 실제 SFT admission 전에는 더 보수적으로 시작한다. 이 결과는 attention-only v1을 대신 측정한 것이 아니다. 선택한 model hash, target module, quant recipe 및 batch/context마다 별도 admission profile을 요구한다.
+
+## 0. 다중 checkpoint 지원 원칙
+
+- 7B/13.3B는 모델 선택 label이며 코드는 고정된 layer 수나 폭을 쓰지 않는다. 실제 체크포인트에서 `L=n_layer`, `D=n_embd`, WKV `H=n_head`, `N=head_size`, 각 linear의 `in/out_features`, base vocab `V`, embedding/head shape 및 tied 여부, 학습 context metadata를 읽는다. 모델별 config, tokenizer와 training code가 호환되는 RWKV-7 계열인지도 확인한다.
+- 한 run은 `model_id`, immutable revision, checkpoint SHA-256을 고정한다. worker admission 및 canary/audit은 label이 아닌 이 식별자와 shape manifest를 비교한다.
+- LoRA와 token-row 크기는 tensor shape에서 산출한다. `4D` FFN, vocab 65,536, `L=61`, `D=4096`을 일반 규칙으로 두지 않는다.
+- 7B급 checkpoint는 13.3B와 별도 프로파일 대상으로 다룬다. Parameter count가 작으면 weight와 activation 부담이 낮아질 수 있지만, 각 파일의 1-step profile이 끝나기 전 VRAM admission을 단정하지 않는다.
+- 현재 profile 대상은 사용자가 지정한 `rwkv7-g1k-7.2b-20260930-ctx25600.pth`다. 파일 SHA-256 `0853d4ce2e4e0629762797d05036a84cc69fb2fb9eff5590dd22aeb518a4c842`, metadata shape `L=32,D=4096,H=64,N=64,V=65,536`, FFN width 16,384, BF16이다. 이 수치도 해당 파일 식별자를 위한 manifest 예시다.
+- Context bucket은 checkpoint에서 확인된 training context 이내를 기본 sweep으로 잡는다. RTX 3060의 13.3B profile 결과를 7B나 다른 architecture의 길이 상한으로 복사하지 않는다.
 
 ## 1. 목표와 권장 v1 범위
 
@@ -14,11 +25,11 @@
 
 ## 2. 코드에서 확인한 모델 구조
 
-대상 checkpoint는 61 layers, `D=4096`, vocab 65,536이다. `train_temp/src/model.py`에서 time-mix의 `receptance`, `key`, `value`, `output`은 각각 `nn.Linear(D,D,bias=False)`이고, `RWKV7_CLAMPW_CUDA` 앞뒤의 activation을 입력/출력으로 사용한다. 해당 projection에 대한 LoRA는 기존 fused WKV custom autograd의 입력 gradient를 통해 전달할 수 있어 WKV kernel 자체를 바꿀 필요가 없다.
+구조 관찰과 수치 예시는 현재 지정한 13.3B checkpoint(61 layers, `D=4096`, vocab 65,536)에 대한 것이다. Worker는 각 checkpoint의 config/state dict에서 dimensions를 검증해 사용한다. `train_temp/src/model.py`의 time-mix `receptance`, `key`, `value`, `output`은 해당 모델의 실제 `D→D` projection이며, `RWKV7_CLAMPW_CUDA` 앞뒤 activation을 사용한다. 이 projection LoRA의 입력 gradient는 기존 fused WKV custom autograd 경로로 전달 가능하므로 WKV initial-state gradient 변경은 필요 없다.
 
 Channel-mix는 `key: D→4D`, `value: 4D→D`지만 fast path가 두 `weight`를 `_CmixLayerV2Fn` custom CUDA op에 직접 넘긴다. 일반 `nn.Linear` wrapper만 씌워서는 LoRA branch가 호출되지 않는다. 1차 구현은 이를 건드리지 않고, 향후 eager PyTorch reference 또는 adapter 입력을 받는 fused kernel을 추가한다.
 
-모델의 `emb.weight`와 `head.weight`는 모두 vocab 65,536행이지만 서로 별도 matrix다. 따라서 새 token의 입력 embedding과 출력 head 행도 별도 파라미터로 둔다. model 안의 native `w1/w2`, `a1/a2`, `v1/v2`, `g1/g2`는 RWKV-7 time-mix의 기존 저랭크 구조이므로 이 설계의 LoRA 대상 projection과 혼동하지 않는다.
+이 profile의 `emb.weight`와 `head.weight`는 vocab 65,536행이며 서로 별도 matrix다. 각 선택 checkpoint에서는 이 shape와 tying 여부를 검사한다. 새 token의 embedding/head 행은 기존 행과 별도 parameter다. model 안의 native `w1/w2`, `a1/a2`, `v1/v2`, `g1/g2`는 RWKV-7의 기존 저랭크 구조이며 이 설계의 LoRA 대상 projection과 혼동하지 않는다.
 
 ## 3. LoRA parameterization
 
@@ -35,16 +46,18 @@ frozen linear weight를 `W ∈ R[out,in]`이라 할 때 다음을 계산한다.
 
 ### 대상 모듈과 통신량
 
-| 설정 | 모듈 | rank 8 trainable 값 | fp32 gradient payload |
+| checkpoint | target | rank 8 trainable 값 | fp32 gradient payload |
 | --- | --- | ---: | ---: |
-| v1 권장 | layer별 `att.receptance/key/value/output` | 15,990,784 | 61 MiB |
-| 확장 | 위 4개 + layer별 `ffn.key/value` | 35,979,264 | 137.25 MiB |
+| 7.2B (`L=32`) | attention-only v1 | 8,388,608 | 32 MiB |
+| 13.3B (`L=61`) | attention-only v1 | 15,990,784 | 61 MiB |
+| 7.2B (`L=32`) | attention + FFN all-linear | 18,874,368 | 72 MiB |
+| 13.3B (`L=61`) | attention + FFN all-linear | 35,979,264 | 137.25 MiB |
 
-계산은 `D=4096`, 61 layers, FFN hidden `4D=16384` 기준이다. 한 LoRA linear는 `r×(in+out)` 값이다. rank 4는 위 표 payload의 절반, rank 16은 두 배다. 이 payload는 한 unit의 summed gradient 크기이며, adapter snapshot 다운로드도 대략 같은 크기다. special token 행은 여기에 추가된다.
+표는 두 지정 checkpoint의 실제 shape에서 계산한 rank-8 예시다. 일반 계산은 각 target `nn.Linear`마다 `r×(in_features+out_features)`를 합산한다. 즉 `P_lora=Σ_m r(in_m+out_m)`이고 fp32 gradient payload는 `4×P_lora` bytes다. rank를 바꾸면 선형 비례한다. 이 payload는 unit의 summed gradient 크기이며 adapter snapshot 다운로드도 대략 같다. special token 행은 별도 추가한다.
 
-각 special token `M`개에 대해 별도 fp32 행 `E_new,H_new ∈ R[M,D]`를 둔다. 65,536개 기존 token ID는 유지하고 신규 ID는 `[65536,65536+M)`에 append한다. 추가 크기는 파라미터 또는 gradient 기준 토큰당 32 KiB이며, 16개면 512 KiB다.
+각 special token `M`개에 대해 별도 fp32 행 `E_new,H_new ∈ R[M,D]`를 둔다. 기존 token ID `[0,V)`는 유지하고 신규 ID는 `[V,V+M)`에 append한다. 추가 크기는 parameter 또는 fp32 gradient 기준 `2×M×D×4` bytes다. 이번 `D=4096` checkpoint에서만 토큰당 32 KiB이며, 다른 폭이면 공식에 따라 달라진다.
 
-- 입력 token ID `<65536`은 frozen `emb.weight`에서 조회하고 추가 ID는 `E_new`에서 조회한다.
+- 입력 token ID `<V`는 frozen `emb.weight`에서 조회하고 추가 ID는 `E_new`에서 조회한다.
 - 기존 `ln_out` 이후의 표현 `z`에 대해 base head logits와 `z @ H_new.T`를 이어 전체 확장 vocab의 CE를 계산한다.
 - 생성 대상 special token은 assistant target label에 있어야 `H_new`가 긍정 target 신호를 받는다. 입력 전용 marker는 embedding 학습 대상이지만 head는 softmax denominator 억제 신호만 받는다.
 - 각 행은 확장 전 tokenizer로 literal 문자열을 인코딩한 기존 ID들의 해당 embedding/head 행 평균으로 초기화한다. 빈 분해에는 norm-matched deterministic random 초기값을 쓰고 seed/방법을 기록한다.
@@ -85,9 +98,11 @@ LoRA v1의 통신량은 soft prompt나 WKV low-rank state보다 훨씬 크다. r
 
 RWKV에는 transformer식 positional embedding의 고정 context limit이 없다. 공식 RWKV 자료도 이론상 긴 context 처리가 가능하다고 설명하지만, 실제 품질은 학습 context와 수치 정밀도의 영향을 받는다 ([RWKV-LM](https://github.com/BlinkDL/RWKV-LM), [context-length discussion](https://github.com/BlinkDL/RWKV-LM/discussions/179)). 지정 checkpoint의 `ctx25600`은 학습된 context 길이다. `train_temp`는 `args.ctx_len`을 늘리면 forward 상한을 올릴 수 있고, 현재 fused WKV kernel의 고정 chunk 길이는 16 token이다. 따라서 모든 sequence 길이는 16의 배수로 맞춘다.
 
-- v1은 길이별 bucket을 `4096 → 8192 → 16384 → 25600`으로 늘려 평가하고, run manifest의 `max_ctx_len`은 우선 **25,600**으로 둔다. 예제는 실제 길이별로 묶고 tail만 16의 배수로 padding해 loss mask를 적용한다. 독립 row를 유지하고 대화들을 한 recurrent stream에 packing하지 않는다.
+- 목표 context 상한은 각 checkpoint의 config/model card에서 확인한 training context로 정한다. 이번 checkpoint는 25,600이며 bucket은 짧은 길이에서 시작해 `1024/2048` 등 실측에서 가능성이 확인된 길이를 포함하고 이후 `3072 → 4096 → 8192 → 16384 → 25600` 순으로 단계별 admission한다. 현재 RTX 3060의 all-linear 13.3B profile은 FP32 master adapter 기준 2,560까지 실행됐지만 여유가 거의 없고 3,072에서 OOM이다. 7.2B는 4,096까지 실행됐고 6,144는 여유가 거의 없다. 다른 모델은 별도 sweep을 한다. 모든 row 길이는 fused WKV 16-token 경계에 맞추고 독립 예제를 packing하지 않는다.
 - 25,600 초과는 코드상 시도할 수 있지만 checkpoint의 학습 범위를 넘어선다. long-context SFT 데이터와 별도 held-out 검증이 있을 때 `32768`, 이후 `51200`을 exploratory run으로 추가한다. 길이만 늘리고 긴 의존성을 담은 학습 예제가 없으면 성능 개선을 가정하지 않는다.
-- `train_temp`의 custom WKV backward는 `s[B,H,T/16,N,N]`와 `sa[B,T,H,N]` fp32 buffer를 만든다. 이 checkpoint의 `H=N=64`에서 한 활성 sequence row 기준 buffer 합은 대략 80 KiB/token, `T=25,600`이면 약 1.95 GiB다(모델 activation과 기타 workspace 제외). 길이가 두 배면 이 항도 두 배다. gradient checkpointing을 켜고, 긴 bucket에서는 동시 micro-batch를 낮춰 peak VRAM을 제어한 뒤 local accumulation으로 effective batch를 유지한다.
+- `train_temp`의 custom WKV backward는 fp32 `s[B,H,T/16,N,N]`와 `sa[B,T,H,N]` buffer를 만든다. 일반 scratch 산식은 약 `4×B_micro×H×T×(N²/16+N)` bytes다. 이번 checkpoint의 `H=N=64`에서는 row당 약 80 KiB/token, `T=25,600`이면 약 1.95 GiB이며 다른 모델은 실제 `H,N`으로 계산한다. 길이/동시 batch를 키우면 이 항도 비례해 커진다. Gradient checkpointing과 local gradient accumulation을 사용하되, accumulation은 한 번에 동시 실행하는 micro-batch의 peak를 낮게 유지한다.
+
+현재 13.3B all-linear QLoRA profile은 FP32 master adapter로 같은 총 2,048 tokens에서 `B=1,T=2048`과 `B=2,T=1024`를 실행했다. 둘 다 통과했지만 peak reserved는 11,254 MiB (10.99 GiB)로 여유가 약 0.64 GiB다. 7.2B에서는 `B=1,T=4096`, `B=2,T=2048`, `B=4,T=1024`가 각각 통과했고 peak reserved는 약 9.11 GiB였다. 이들은 synthetic one-step 조건의 측정이며 추가 token rows/head loss를 포함하지 않는다. 더 큰 effective batch는 통과한 micro-batch에 gradient accumulation을 더해 늘리고, 더 큰 simultaneous batch는 checkpoint별 admission sweep으로 정한다.
 
 1. rank 4와 attention-only 대상으로 gradient 품질과 전송시간을 비교한다.
 2. 고정 unit 여러 개의 gradient를 worker에서 합쳐 한 결과로 전송하는 macro-unit을 검토한다. 이 방식은 per-unit clipping/audit 해상도가 낮아지므로 audit은 macro-unit 전체를 재계산한다.
@@ -115,18 +130,19 @@ QLoRA 기준 recipe는 frozen dense base weight를 4-bit NF4로 저장하고, qu
 - Embedding은 frozen bf16 lookup으로 시작한다. Head는 기존 L2Wrap raw-weight CUDA 경로를 끄거나 수정하고, 확장 vocab logits의 output/gradient를 chunked CE로 계산한다. QLoRA의 1차 correctness path는 plain summed CE로 고정한다.
 - 모든 quantized base 연산은 base weight gradient를 만들지 않으면서 입력 activation gradient를 LoRA 및 `E_new`까지 전달해야 한다. 이 점을 admission parity에서 검증한다.
 
-GGUF/rwkv.cpp inference 경로는 이 학습 경로의 대체재가 아니다. QLoRA worker의 quantization recipe(예: NF4 + double quant + bf16 compute)는 round manifest에 고정하고, 서로 다른 recipe의 gradient를 한 round에서 섞지 않는다. LoRA는 optimizer/gradient memory를 줄이지만, activation memory는 별도이므로 13.3B의 실제 peak VRAM/속도는 batch 설정과 함께 측정한다.
+GGUF/rwkv.cpp inference 경로는 이 학습 경로의 대체재가 아니다. QLoRA worker의 quantization recipe(예: NF4 + double quant + bf16 compute)는 round manifest에 고정하고 서로 다른 recipe의 gradient를 섞지 않는다. 13.3B all-linear FP32-master profile은 2,048-token step에서 peak allocated 10,566 MiB / reserved 11,254 MiB였고, 지정 7.2B all-linear FP32-master profile은 4,096-token step에서 reserved 9,324 MiB였다. LoRA target 수가 더 적은 attention-only v1과 added-token rows의 peak는 별도 측정한다. Activation memory와 head/loss 경로는 checkpoint parameter count만으로 유도하지 않는다.
 
 ## 8. 검증 단계와 위험
 
 1. **Reference:** 작은 모델/짧은 입력에서 일반 `nn.Linear` LoRA가 RWKV attention projection별 output/gradient reference와 맞는지 비교한다.
-2. **13.3B single GPU:** bf16 LoRA 기준선과 NF4 QLoRA 기준선을 모두 attention-only rank-4/8, special token rows로 학습하고 peak VRAM, tokens/s, loss, held-out task metric을 기록한다. Effective unit을 기존보다 큰 16k–64k total tokens로 올리되, OOM이면 동시 micro-batch를 낮추고 local accumulation은 유지한다.
-3. **Custom-op parity:** fused WKV를 통과하는 `A/B` gradient와 LoRA 없는 원본 forward가 B=0에서 일치하는지 확인한다.
-4. **Special token gate:** 기존 ID 보존, 신규 단일-ID encoding, `E_new` 입력 gradient, target에 있는 `H_new` gradient 및 finite 여부를 검사한다.
-5. **Distributed equivalence:** 동일 unit 집합의 single-batch gradient와 여러 unit에서 합산한 gradient가 clipping 전 token-weighted 기준으로 tolerance 내에서 맞아야 한다.
-6. **Network/fault simulation:** 16k–64k token unit의 61 MiB gradient 전송, 재발급, 중복/오래된 adapter 결과, canary/audit 및 rollback을 측정한다.
+2. **7.2B checkpoint profile:** 지정된 `rwkv7-g1k-7.2b-20260930-ctx25600.pth`의 metadata/hash를 고정하고 all-linear QLoRA rank-8 reference sweep을 수행했다. 이어 attention-only QLoRA rank-4/8 및 special-token rows를 실제 v1 경로로 측정하고, 통과한 설정에서 품질 baseline을 만든다.
+3. **13.3B reference profile:** 현재 full-model 측정은 all-linear rank-8 QLoRA와 synthetic token rows 없는 설정이다. 설계 v1의 attention-only rank-4/8 및 추가 token rows를 별도로 측정한다. BF16 LoRA는 가중치 자체가 현재 RTX 3060에 맞지 않으므로 더 큰 VRAM worker에서 기준을 만든다.
+4. **Custom-op parity:** fused WKV를 통과하는 `A/B` gradient와 LoRA 없는 원본 forward가 B=0에서 일치하는지 확인한다.
+5. **Special token gate:** 기존 ID `[0,V)` 보존, 신규 단일-ID encoding, `E_new` 입력 gradient, target에 있는 `H_new` gradient 및 finite 여부를 검사한다.
+6. **Distributed equivalence:** 동일 unit 집합의 single-batch gradient와 여러 unit에서 합산한 gradient가 clipping 전 token-weighted 기준으로 tolerance 내에서 맞아야 한다.
+7. **Network/fault simulation:** checkpoint별 실제 gradient payload, unit token budget, 재발급, 중복/오래된 adapter 결과, canary/audit 및 rollback을 측정한다.
 
-주요 제약은 LoRA가 WKV state tuning보다 통신량과 trainable parameter 수가 크다는 점, QLoRA는 특히 FFN custom op 경로를 고쳐야 한다는 점이다. 더 큰 effective batch는 gradient 변동을 낮추고 LoRA 전송량/토큰 비율을 줄이지만, unit 완료시간과 activation peak를 높일 수 있다. v1 attention-only LoRA는 현재 WKV initial-state backward 확장 없이 적용 가능하고, QLoRA는 frozen base 저장량도 줄인다.
+주요 제약은 LoRA가 WKV state tuning보다 통신량과 trainable parameter 수가 크다는 점, QLoRA는 특히 FFN custom-op 경로를 고쳐야 한다는 점이다. 더 큰 effective batch는 gradient 변동과 토큰당 통신비용을 낮출 수 있지만 unit 완료시간을 늘린다. Peak VRAM은 동시 micro-batch와 context에 좌우되므로 accumulation과 분리해 설정한다. v1 attention-only LoRA는 initial-state backward 변경 없이 적용 가능하고 QLoRA는 frozen base 저장량을 줄인다.
 
 ## 참고 코드
 

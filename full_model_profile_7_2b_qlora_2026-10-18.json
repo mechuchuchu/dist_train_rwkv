@@ -1,0 +1,129 @@
+{
+  "timestamp_utc": "2026-10-18T05:24:03.933386+00:00",
+  "checkpoint": "/workspace/.hf_home/hub/models--BlinkDL--rwkv7-g1/snapshots/2a17e911155a5be23a4ed2792e978c77038f14e2/rwkv7-g1k-7.2b-20260930-ctx25600.pth",
+  "checkpoint_size_bytes": 14400007869,
+  "model_shape": {
+    "n_layer": 32,
+    "n_embd": 4096,
+    "vocab_size": 65536,
+    "dim_att": 4096,
+    "dim_ffn": 16384,
+    "head_size": 64,
+    "n_head": 64,
+    "embedding_dtype": "torch.bfloat16",
+    "embedding_shape": [
+      65536,
+      4096
+    ],
+    "head_shape": [
+      65536,
+      4096
+    ]
+  },
+  "n_layer": 32,
+  "n_embd": 4096,
+  "vocab_size": 65536,
+  "base_quantization": "bitsandbytes NF4, double quantization, BF16 compute",
+  "lora_rank": 8,
+  "lora_alpha": 16.0,
+  "quantized_linear_count": 192,
+  "trainable_adapter_parameters": 18874368,
+  "embedding_and_head": "frozen BF16; no extra token rows in synthetic probe",
+  "activation_checkpointing": "torch.utils.checkpoint, each RWKV block",
+  "cmix_path": "upstream eager Cmix reference routed through quantized modules",
+  "device": "NVIDIA GeForce RTX 3060",
+  "torch": "2.11.0+cu128",
+  "cuda_runtime": "12.8",
+  "cases": [
+    {
+      "batch": 1,
+      "context": 1024,
+      "tokens_per_step": 1024,
+      "loss": 11.875,
+      "step_seconds": 2.497275660003652,
+      "tokens_per_second": 410.04684280569273,
+      "allocated_before_mib": 4651.6728515625,
+      "peak_allocated_mib": 5599.080078125,
+      "peak_reserved_mib": 5968.0,
+      "free_before_mib": 7112.375,
+      "total_gpu_mib": 11911.3125,
+      "cuda_allocated_after_mib": 4891.92333984375
+    },
+    {
+      "batch": 2,
+      "context": 1024,
+      "tokens_per_step": 2048,
+      "loss": 11.8125,
+      "step_seconds": 4.1411077980010305,
+      "tokens_per_second": 494.5536556639742,
+      "allocated_before_mib": 4739.9384765625,
+      "peak_allocated_mib": 6465.126953125,
+      "peak_reserved_mib": 6856.0,
+      "free_before_mib": 6928.375,
+      "total_gpu_mib": 11911.3125,
+      "cuda_allocated_after_mib": 5043.93896484375
+    },
+    {
+      "batch": 1,
+      "context": 2048,
+      "tokens_per_step": 2048,
+      "loss": 11.5625,
+      "step_seconds": 4.201182411998161,
+      "tokens_per_second": 487.481808490656,
+      "allocated_before_mib": 4739.9384765625,
+      "peak_allocated_mib": 6465.126953125,
+      "peak_reserved_mib": 6856.0,
+      "free_before_mib": 6928.375,
+      "total_gpu_mib": 11911.3125,
+      "cuda_allocated_after_mib": 5043.93896484375
+    },
+    {
+      "batch": 1,
+      "context": 3072,
+      "tokens_per_step": 3072,
+      "loss": 11.4375,
+      "step_seconds": 6.079592648995458,
+      "tokens_per_second": 505.2970120469489,
+      "allocated_before_mib": 4739.9541015625,
+      "peak_allocated_mib": 7315.173828125,
+      "peak_reserved_mib": 8128.0,
+      "free_before_mib": 6928.375,
+      "total_gpu_mib": 11911.3125,
+      "cuda_allocated_after_mib": 5195.95458984375
+    },
+    {
+      "batch": 1,
+      "context": 4096,
+      "tokens_per_step": 4096,
+      "loss": 11.3125,
+      "step_seconds": 8.10784581900225,
+      "tokens_per_second": 505.18967570896075,
+      "allocated_before_mib": 4739.9697265625,
+      "peak_allocated_mib": 8173.720703125,
+      "peak_reserved_mib": 9176.0,
+      "free_before_mib": 6928.375,
+      "total_gpu_mib": 11911.3125,
+      "cuda_allocated_after_mib": 5347.97021484375
+    },
+    {
+      "batch": 1,
+      "context": 6144,
+      "tokens_per_step": 6144,
+      "loss": 11.25,
+      "step_seconds": 11.997645413008286,
+      "tokens_per_second": 512.1004820944659,
+      "allocated_before_mib": 4740.0009765625,
+      "peak_allocated_mib": 9889.814453125,
+      "peak_reserved_mib": 11212.0,
+      "free_before_mib": 6926.375,
+      "total_gpu_mib": 11911.3125,
+      "cuda_allocated_after_mib": 5652.00146484375
+    }
+  ],
+  "oom_case": {
+    "batch": 1,
+    "context": 8192,
+    "error": "CUDA out of memory. Tried to allocate 256.00 MiB. GPU 0 has a total capacity of 11.63 GiB of which 14.38 MiB is free. Process 2563527 has 11.61 GiB memory in use. Of the allocated memory 11.08 GiB is allocated by PyTorch, and 393.72 MiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://docs.pytorch.org/docs/stable/notes/cuda.html#optimizing-memory-usage-with-pytorch-cuda-alloc-conf)"
+  },
+  "host_peak_rss_gib": 14.326416015625
+}

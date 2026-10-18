@@ -1,0 +1,118 @@
+{
+  "timestamp_utc": "2026-10-18T05:32:56.223851+00:00",
+  "checkpoint": "/workspace/.hf_home/hub/models--BlinkDL--rwkv7-g1/snapshots/2a17e911155a5be23a4ed2792e978c77038f14e2/rwkv7-g1k-13.3b-20260930-ctx25600.pth",
+  "checkpoint_size_bytes": 26540868485,
+  "model_shape": {
+    "n_layer": 61,
+    "n_embd": 4096,
+    "vocab_size": 65536,
+    "dim_att": 4096,
+    "dim_ffn": 16384,
+    "head_size": 64,
+    "n_head": 64,
+    "embedding_dtype": "torch.bfloat16",
+    "embedding_shape": [
+      65536,
+      4096
+    ],
+    "head_shape": [
+      65536,
+      4096
+    ],
+    "checkpoint_tensor_elements": 13270298624,
+    "native_time_mix_ranks": {
+      "w1": 192,
+      "a1": 192,
+      "v1": 128,
+      "g1": 384
+    }
+  },
+  "n_layer": 61,
+  "n_embd": 4096,
+  "vocab_size": 65536,
+  "base_quantization": "bitsandbytes NF4, double quantization, BF16 compute",
+  "lora_rank": 8,
+  "lora_alpha": 16.0,
+  "adapter_dtype": "FP32 master factors and AdamW state; BF16 matmul",
+  "quantized_linear_count": 366,
+  "trainable_adapter_parameters": 35979264,
+  "embedding_and_head": "frozen BF16; no extra token rows in synthetic probe",
+  "activation_checkpointing": "torch.utils.checkpoint, each RWKV block",
+  "cmix_path": "upstream eager Cmix reference routed through quantized modules",
+  "device": "NVIDIA GeForce RTX 3060",
+  "torch": "2.11.0+cu128",
+  "cuda_runtime": "12.8",
+  "cases": [
+    {
+      "batch": 1,
+      "context": 1024,
+      "tokens_per_step": 1024,
+      "loss": 11.8125,
+      "step_seconds": 4.537032720007119,
+      "tokens_per_second": 225.6981739374349,
+      "allocated_before_mib": 8084.4267578125,
+      "peak_allocated_mib": 9265.708984375,
+      "peak_reserved_mib": 9934.0,
+      "free_before_mib": 3690.375,
+      "total_gpu_mib": 11911.3125,
+      "cuda_allocated_after_mib": 8527.17724609375
+    },
+    {
+      "batch": 2,
+      "context": 1024,
+      "tokens_per_step": 2048,
+      "loss": 11.75,
+      "step_seconds": 7.881340521998936,
+      "tokens_per_second": 259.85427152696707,
+      "allocated_before_mib": 8375.1923828125,
+      "peak_allocated_mib": 10566.193359375,
+      "peak_reserved_mib": 11254.0,
+      "free_before_mib": 3240.375,
+      "total_gpu_mib": 11911.3125,
+      "cuda_allocated_after_mib": 8679.19287109375
+    },
+    {
+      "batch": 1,
+      "context": 2048,
+      "tokens_per_step": 2048,
+      "loss": 11.75,
+      "step_seconds": 7.99871212799917,
+      "tokens_per_second": 256.04121853955195,
+      "allocated_before_mib": 8375.1923828125,
+      "peak_allocated_mib": 10566.193359375,
+      "peak_reserved_mib": 11254.0,
+      "free_before_mib": 3240.375,
+      "total_gpu_mib": 11911.3125,
+      "cuda_allocated_after_mib": 8679.19287109375
+    },
+    {
+      "batch": 1,
+      "context": 2560,
+      "tokens_per_step": 2560,
+      "loss": 11.5,
+      "step_seconds": 9.854605988002731,
+      "tokens_per_second": 259.77700205534495,
+      "allocated_before_mib": 8375.2001953125,
+      "peak_allocated_mib": 11103.310546875,
+      "peak_reserved_mib": 11756.0,
+      "free_before_mib": 3240.375,
+      "total_gpu_mib": 11911.3125,
+      "cuda_allocated_after_mib": 8755.20068359375
+    }
+  ],
+  "host_peak_rss_gib": 25.636051177978516,
+  "checkpoint_sha256": "84a633fa02abcbdfcf91258b3b5bc000c66edfee2dbc6743f95a5efe1002fe4a",
+  "gradient_checkpointing": true,
+  "gradient_clipping": false,
+  "source_runs": [
+    "full_model_profile_13_3b_fp32adapter_2026-10-18.json"
+  ],
+  "oom_cases": [
+    {
+      "batch": 1,
+      "context": 3072,
+      "error": "CUDA out of memory. Tried to allocate 384.00 MiB. GPU 0 has a total capacity of 11.63 GiB of which 232.38 MiB is free. Process 2572573 has 11.40 GiB memory in use. Of the allocated memory 10.83 GiB is allocated by PyTorch, and 438.77 MiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://docs.pytorch.org/docs/stable/notes/cuda.html#optimizing-memory-usage-with-pytorch-cuda-alloc-conf)"
+    }
+  ],
+  "profile_note": "Authoritative FP32-master adapter run; synthetic one-step probe. Supersedes earlier BF16-adapter profile figures."
+}

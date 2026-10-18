@@ -1,0 +1,36 @@
+{
+  "timestamp_utc": "2026-10-18T05:15:27.494486+00:00",
+  "checkpoint": "/workspace/.hf_home/hub/models--BlinkDL--rwkv7-g1/snapshots/2a17e911155a5be23a4ed2792e978c77038f14e2/rwkv7-g1k-13.3b-20260930-ctx25600.pth",
+  "n_layer": 61,
+  "n_embd": 4096,
+  "vocab_size": 65536,
+  "base_quantization": "bitsandbytes NF4, double quantization, BF16 compute",
+  "lora_rank": 8,
+  "lora_alpha": 16.0,
+  "quantized_linear_count": 366,
+  "trainable_adapter_parameters": 35979264,
+  "embedding_and_head": "frozen BF16; no extra token rows in synthetic probe",
+  "activation_checkpointing": "torch.utils.checkpoint, each RWKV block",
+  "cmix_path": "upstream eager Cmix reference routed through quantized modules",
+  "device": "NVIDIA GeForce RTX 3060",
+  "torch": "2.11.0+cu128",
+  "cuda_runtime": "12.8",
+  "cases": [
+    {
+      "batch": 2,
+      "context": 1024,
+      "tokens_per_step": 2048,
+      "loss": 11.875,
+      "step_seconds": 8.116414064003038,
+      "tokens_per_second": 252.3281813680561,
+      "allocated_before_mib": 8015.8173828125,
+      "peak_allocated_mib": 10221.880859375,
+      "peak_reserved_mib": 10798.0,
+      "free_before_mib": 3758.375,
+      "total_gpu_mib": 11911.3125,
+      "cuda_allocated_after_mib": 8473.31787109375
+    }
+  ],
+  "oom_case": null,
+  "host_peak_rss_gib": 25.637073516845703
+}
