@@ -29,6 +29,7 @@ coordinator ───────────────────▶ worker 
 | `rwkv_hub.py` | Hugging Face 모델 내려받기, adapter push, Hub 체크포인트 조회 |
 | `rwkv_new_tokens.py` | 변환된 체크포인트가 어휘에 덧붙인 토큰(id 65536 이상)의 임베딩/헤드 행을 학습 가능하게 만드는 hook ([새 토큰 행 학습](#새-토큰-행-학습-변환된-체크포인트)) |
 | `prepare_g1j_protocol_units.py` | 샘플 unit manifest 생성 (4개 행짜리 프로토콜 검증용). `--model-id` 등으로 다른 모델의 tokenizer를 쓸 수 있음 |
+| `convert_k2_horizon/convert_pth_to_hf.py` | RWKV-7 G1 `.pth`를 K2 Horizon 형식(special token 추가, chat template)의 HF 체크포인트로 변환. 학습 코드와 별개의 도구이고 테스트하지 않았습니다. 결과에는 `release-manifest.json`이 없습니다 |
 | `make_initial_adapter.py` | 새 실행의 출발점이 되는 깨끗한 rank-8 LoRA adapter 생성 (CUDA 필요). 모델 크기는 모델 자체에서 읽음 |
 | `validate_g1j_sft_protocol.py` | TRL로 2 step 학습해 보는 프로토콜 검증 스크립트(adapter도 하나 남김) |
 | `validate_g1j_dist_checkpoint.py` | 결과 adapter가 PEFT로 로드되고 coordinator의 theta와 같은지 확인 |
