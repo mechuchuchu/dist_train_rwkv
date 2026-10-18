@@ -411,6 +411,14 @@ class LeanAggregationTests(unittest.TestCase):
         for name, parameter in parameters.items():
             self.assertTrue(torch.equal(coordinator.theta[name], parameter.detach()), name)
 
+    def test_the_reported_gradient_norm_covers_every_tensor_of_the_unit(self):
+        for as_file in (False, True):
+            with self.subTest(as_file=as_file):
+                coordinator = self.make_coordinator()
+                self.submit(coordinator, self.gradients([3.0, 0.0], [4.0]), as_file=as_file)
+                (result,) = coordinator.accepted.values()
+                self.assertAlmostEqual(result["gradient_norm"], 5.0, places=6)  # sqrt(9 + 0 + 16)
+
     def test_individual_gradients_are_not_kept_only_their_running_sum(self):
         coordinator = self.make_coordinator()
         first = self.submit(coordinator, self.gradients([1.0, 2.0], [3.0]), as_file=True, name="a.part")

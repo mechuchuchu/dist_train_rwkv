@@ -37,8 +37,8 @@ from rwkv_dist_protocol import (
     RoundCoordinator,
     adamw_hyperparameters,
     canonical_json,
-    decode_tensors,
-    encode_tensors,
+    default_model_dir,
+    model_slug,
     parameter_name_to_peft_saved_name,
     peft_saved_name_to_parameter_name,
     sha256_bytes,
@@ -56,13 +56,24 @@ from rwkv_hub import (
 )
 
 
-MODEL_ID = "RWKV/RWKV7-G1j-1.5B-20260831"
-MODEL_REVISION = "2c18b29ab7fbece25ff6112281eea0fa41fcb30f"
-MODEL_PATH = Path("/workspace/RWKV7-G1j-1.5B-20260831")
+# The model a run trains unless --model-id/--model-revision say otherwise. Any RWKV7
+# size in the same Hugging Face format works; workers must be started for the same one.
+DEFAULT_MODEL_ID = "RWKV/RWKV7-G1j-1.5B-20260831"
+DEFAULT_MODEL_REVISION = "2c18b29ab7fbece25ff6112281eea0fa41fcb30f"
+LORA_RANK = 8
+LORA_ALPHA = 16
+ATTENTION_MODULES = ("receptance", "key", "value", "output")
 UPLOAD_CHUNK_BYTES = 1024 * 1024
 
-# Where a fresh run looks for its starting adapter; make_initial_adapter.py writes here.
-DEFAULT_INITIAL_ADAPTER_DIR = Path("artifacts/g1j_1.5b_lora_init")
+
+def default_initial_adapter_dir(model_id: str) -> Path:
+    """Where a fresh run looks for its starting adapter; make_initial_adapter.py writes here.
+
+    One folder per model, because an adapter only fits the model it was made for.
+    """
+    return Path("artifacts") / f"{model_slug(model_id)}_lora_init"
+
+
 def worker_bundle_sha256(root: Path) -> str:
     digest = hashlib.sha256()
     for name in WORKER_BUNDLE_FILES:
@@ -72,15 +83,18 @@ def worker_bundle_sha256(root: Path) -> str:
     return digest.hexdigest()
 
 
-def read_manifest(path: Path) -> dict:
+def read_manifest(path: Path, *, model_id: str, model_revision: str) -> dict:
     manifest = json.loads(path.read_text())
     supplied_hash = manifest.get("manifest_sha256")
     content = {key: value for key, value in manifest.items() if key != "manifest_sha256"}
     actual_hash = sha256_bytes(canonical_json(content))
     if supplied_hash != actual_hash:
         raise ValueError(f"data manifest hash mismatch: {supplied_hash} != {actual_hash}")
-    if manifest["model"]["repo"] != MODEL_ID or manifest["model"]["revision"] != MODEL_REVISION:
-        raise ValueError("tokenized shard belongs to a different base model")
+    if manifest["model"]["repo"] != model_id or manifest["model"]["revision"] != model_revision:
+        raise ValueError(
+            f"tokenized shard was made for {manifest['model']['repo']}@{manifest['model']['revision']}, "
+            f"not {model_id}@{model_revision}"
+        )
     if not manifest.get("units"):
         raise ValueError("tokenized shard is empty")
     return manifest
@@ -114,28 +128,90 @@ def build_round_plan(
     return plan
 
 
-def load_initial_theta(adapter_dir: Path) -> dict[str, torch.Tensor]:
+_LORA_NAME = re.compile(
+    r"^(?P<module>.*\.layers\.(?P<layer>\d+)\.att\.(?P<kind>receptance|key|value|output))"
+    r"\.lora_(?P<factor>[AB])\.default\.weight$"
+)
+
+
+def expected_lora_shapes(num_layers: int, hidden_size: int) -> dict[str, tuple[int, int]]:
+    """Tensor name -> shape of the rank-8 attention LoRA for an RWKV7 of this size."""
+    shapes = {}
+    for layer in range(num_layers):
+        for kind in ATTENTION_MODULES:
+            prefix = f"base_model.model.model.layers.{layer}.att.{kind}"
+            shapes[f"{prefix}.lora_A.default.weight"] = (LORA_RANK, hidden_size)
+            shapes[f"{prefix}.lora_B.default.weight"] = (hidden_size, LORA_RANK)
+    return shapes
+
+
+def read_model_shape(model_dir: Path) -> tuple[int, int] | None:
+    """(layers, hidden size) from the snapshot's config.json, or None if it has none."""
+    config_path = model_dir / "config.json"
+    if not config_path.is_file():
+        return None
+    config = json.loads(config_path.read_text())
+    try:
+        return int(config["num_hidden_layers"]), int(config["hidden_size"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError(f"{config_path} lacks num_hidden_layers / hidden_size") from exc
+
+
+def check_lora_structure(theta: dict[str, torch.Tensor]) -> tuple[int, int]:
+    """Check that `theta` is a complete rank-8 attention LoRA; return (layers, hidden size)."""
+    if not theta:
+        raise ValueError("initial adapter holds no LoRA tensors")
+    modules: dict[str, dict[str, torch.Tensor]] = {}
+    layers: dict[int, set[str]] = {}
+    for name, tensor in theta.items():
+        match = _LORA_NAME.match(name)
+        if match is None:
+            raise ValueError(f"unexpected tensor in initial adapter: {name}")
+        modules.setdefault(match["module"], {})[match["factor"]] = tensor
+        layers.setdefault(int(match["layer"]), set()).add(match["kind"])
+    widths = set()
+    for module, factors in modules.items():
+        if set(factors) != {"A", "B"}:
+            raise ValueError(f"{module} has only lora_{next(iter(factors))}; need both factors")
+        a, b = factors["A"], factors["B"]
+        if a.ndim != 2 or b.ndim != 2 or a.shape[0] != LORA_RANK or b.shape[1] != LORA_RANK \
+                or a.shape[1] != b.shape[0]:
+            raise ValueError(f"{module} is not a rank-{LORA_RANK} LoRA pair: "
+                             f"A {tuple(a.shape)}, B {tuple(b.shape)}")
+        widths.add(int(a.shape[1]))
+    if len(widths) != 1:
+        raise ValueError(f"attention widths differ across modules: {sorted(widths)}")
+    if sorted(layers) != list(range(len(layers))) or any(
+            kinds != set(ATTENTION_MODULES) for kinds in layers.values()):
+        raise ValueError("initial adapter must cover receptance/key/value/output of layers 0..N-1")
+    return len(layers), widths.pop()
+
+
+def load_initial_theta(adapter_dir: Path, *,
+                       model_shape: tuple[int, int] | None = None) -> dict[str, torch.Tensor]:
+    """Read the starting adapter; with `model_shape` (layers, hidden) also match it to that model."""
     missing = [name for name in ("adapter_config.json", "adapter_model.safetensors")
                if not (adapter_dir / name).is_file()]
     if missing:
-        raise FileNotFoundError(
-            f"initial adapter {adapter_dir} is missing {', '.join(missing)}; create a fresh "
-            f"rank-8 adapter with: python make_initial_adapter.py --output-dir {adapter_dir}"
-        )
+        raise FileNotFoundError(f"initial adapter {adapter_dir} is missing {', '.join(missing)}")
     adapter_config = json.loads((adapter_dir / "adapter_config.json").read_text())
-    if int(adapter_config.get("r", -1)) != 8 or int(adapter_config.get("lora_alpha", -1)) != 16:
-        raise ValueError("initial adapter must be rank 8 / alpha 16")
+    if int(adapter_config.get("r", -1)) != LORA_RANK or int(adapter_config.get("lora_alpha", -1)) != LORA_ALPHA:
+        raise ValueError(f"initial adapter must be rank {LORA_RANK} / alpha {LORA_ALPHA}")
     state = load_file(str(adapter_dir / "adapter_model.safetensors"), device="cpu")
     theta = {}
     for name, tensor in state.items():
         if ".lora_A." not in name and ".lora_B." not in name:
             continue
         if name.endswith(".lora_A.weight") or name.endswith(".lora_B.weight"):
-            from rwkv_dist_protocol import peft_saved_name_to_parameter_name
             name = peft_saved_name_to_parameter_name(name)
         theta[name] = tensor.float().contiguous()
-    if len(theta) != 192 or sum(t.numel() for t in theta.values()) != 3_145_728:
-        raise ValueError(f"unexpected initial adapter tensor schema: {len(theta)} tensors")
+    layers, width = check_lora_structure(theta)
+    if model_shape is not None and (layers, width) != tuple(model_shape):
+        raise ValueError(
+            f"initial adapter was made for a model with {layers} layers of width {width}, but this "
+            f"run's base model has {model_shape[0]} layers of width {model_shape[1]}; create a "
+            f"matching one with make_initial_adapter.py"
+        )
     return theta
 
 
@@ -333,7 +409,6 @@ class Application:
         self.persist_lock = threading.RLock()
         self.hub_push_queue: queue.Queue = queue.Queue()
         self.hub_push_thread: threading.Thread | None = None
-        self.event_cursor = 0
         self.run_dir.mkdir(parents=True, exist_ok=True)
         (self.run_dir / "gradients").mkdir(exist_ok=True)
         # Uploads are streamed here before they are validated; anything left from
@@ -358,13 +433,12 @@ class Application:
         heartbeat in RAM.
         """
         with self.persist_lock:
-            events = self.coordinator.events[self.event_cursor:]
+            events = list(self.coordinator.events)
             if events:
                 with (self.run_dir / "round_log.jsonl").open("a") as f:
                     for event in events:
                         f.write(json.dumps(event, sort_keys=True, ensure_ascii=False) + "\n")
-                del self.coordinator.events[:self.event_cursor + len(events)]
-                self.event_cursor = 0
+                del self.coordinator.events[:len(events)]
 
     def stream_upload(self, source, size: int) -> PayloadFile:
         """Copy `size` bytes from `source` to a file in incoming/, hashing as they pass.
@@ -995,10 +1069,14 @@ def make_handler(app: Application):
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--units", type=Path, required=True)
-    parser.add_argument("--model-id", default=MODEL_ID)
-    parser.add_argument("--model-revision", default=MODEL_REVISION,
+    parser.add_argument("--model-id", default=DEFAULT_MODEL_ID,
+                        help="base model repository; any RWKV7 size in the same format. Workers "
+                             "must be started with the same --model-id/--model-revision "
+                             "(default: %(default)s)")
+    parser.add_argument("--model-revision", default=DEFAULT_MODEL_REVISION,
                         help="immutable Hugging Face commit SHA")
-    parser.add_argument("--model-dir", type=Path, default=MODEL_PATH)
+    parser.add_argument("--model-dir", type=Path, default=None,
+                        help="local snapshot of the base model (default: /workspace/<model name>)")
     parser.add_argument("--fetch-model-from-hf", action="store_true",
                         help="download the pinned model snapshot before starting the coordinator")
     parser.add_argument("--hf-cache-dir", type=Path, default=None)
@@ -1022,9 +1100,9 @@ def main() -> None:
                              "checkpoints/ in the Hub repository)")
     parser.add_argument("--hf-version", type=int, default=None,
                         help="exact theta version to resume from; default is the newest that verifies")
-    parser.add_argument("--initial-adapter-dir", type=Path, default=DEFAULT_INITIAL_ADAPTER_DIR,
+    parser.add_argument("--initial-adapter-dir", type=Path, default=None,
                         help="rank-8 PEFT adapter a fresh run starts from; create one with "
-                             "make_initial_adapter.py (default: %(default)s)")
+                             "make_initial_adapter.py (default: artifacts/<model name>_lora_init)")
     parser.add_argument("--run-dir", type=Path, default=Path("runs/g1j_local_protocol/round-0001"))
     parser.add_argument("--bind", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=17821)
@@ -1079,8 +1157,16 @@ def main() -> None:
         parser.error("--push-adapter-to-hf requires --hf-token or HF_TOKEN (coordinator only)")
     if args.hf_adapter_repo and not (args.push_adapter_to_hf or args.resume_from_hf):
         parser.error("--hf-adapter-repo requires --push-adapter-to-hf or --resume-from-hf")
-    if args.model_id != MODEL_ID or args.model_revision != MODEL_REVISION:
-        parser.error("this coordinator prototype is pinned to the G1j 1.5B repo and revision")
+    if not re.fullmatch(r"[0-9a-f]{40}", args.model_revision):
+        parser.error("--model-revision must be a full 40-character commit hash, not a branch or tag")
+    try:
+        run_name = model_slug(args.model_id)
+    except ValueError as exc:
+        parser.error(str(exc))
+    if args.model_dir is None:
+        args.model_dir = default_model_dir(args.model_id)
+    if args.initial_adapter_dir is None:
+        args.initial_adapter_dir = default_initial_adapter_dir(args.model_id)
     if args.push_adapter_to_hf and args.hf_push_optimizer == "always" and args.hf_adapter_public:
         print("WARNING: --hf-push-optimizer always with --hf-adapter-public uploads AdamW moments "
               "(derived from training gradients) to a public repository.", flush=True)
@@ -1089,9 +1175,11 @@ def main() -> None:
               "auto; a later --resume-from-hf will restart the Adam moments cold.", flush=True)
     if args.bind not in ("127.0.0.1", "localhost", "::1"):
         print("WARNING: this development server is plain HTTP. Expose it only behind TLS/authenticated networking.", flush=True)
-    manifest = read_manifest(args.units)
-    if manifest["model"]["repo"] != args.model_id or manifest["model"]["revision"] != args.model_revision:
-        raise ValueError("tokenized data manifest does not match the requested model id/revision")
+    try:
+        manifest = read_manifest(args.units, model_id=args.model_id,
+                                 model_revision=args.model_revision)
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        parser.error(f"cannot use --units {args.units}: {type(exc).__name__}: {exc}")
     model_dir = ensure_hf_checkpoint(
         args.model_id, args.model_revision, args.model_dir,
         fetch_from_hf=args.fetch_model_from_hf,
@@ -1100,6 +1188,10 @@ def main() -> None:
     )
     release_manifest_path = model_dir / "release-manifest.json"
     base_manifest = json.loads(release_manifest_path.read_text())
+    try:
+        serialized_parameter_count = base_manifest["conversion"]["serialized_parameter_count"]
+    except (KeyError, TypeError):
+        parser.error(f"{release_manifest_path} has no conversion.serialized_parameter_count")
     if manifest["model"]["release_manifest_sha256"] != sha256_bytes(release_manifest_path.read_bytes()):
         raise ValueError("local base model manifest does not match the tokenized data shard")
     round_plan = build_round_plan(
@@ -1138,22 +1230,33 @@ def main() -> None:
     initial_theta = None
     if loaded is None:
         try:
-            initial_theta = load_initial_theta(args.initial_adapter_dir)
-        except (FileNotFoundError, ValueError) as exc:
+            model_shape = read_model_shape(model_dir)
+            if model_shape is None:
+                print(f"NOTE: {model_dir}/config.json not found; the initial adapter is checked for "
+                      "structure only, and workers verify the exact tensor names and shapes.", flush=True)
+            initial_theta = load_initial_theta(args.initial_adapter_dir, model_shape=model_shape)
+        except FileNotFoundError as exc:
+            parser.error(
+                f"cannot start from {args.initial_adapter_dir}: {exc}. Create a fresh rank-{LORA_RANK} "
+                f"adapter for this model (on a worker machine) with: python make_initial_adapter.py "
+                f"--model-id {args.model_id} --model-revision {args.model_revision} "
+                f"--base-model {model_dir} --output-dir {args.initial_adapter_dir}"
+            )
+        except ValueError as exc:
             parser.error(f"cannot start from {args.initial_adapter_dir}: {exc}")
     worker_hash = worker_bundle_sha256(Path(__file__).parent)
     base = {
-        "repo": MODEL_ID,
-        "revision": MODEL_REVISION,
+        "repo": args.model_id,
+        "revision": args.model_revision,
         "release_manifest_sha256": manifest["model"]["release_manifest_sha256"],
-        "serialized_parameter_count": base_manifest["conversion"]["serialized_parameter_count"],
+        "serialized_parameter_count": serialized_parameter_count,
         "dtype": "bfloat16",
     }
     try:
         coordinator, start_index = build_coordinator(
             round_plan=round_plan, plan_sha256=plan_sha256, manifest=manifest, base=base,
             worker_code_sha256=worker_hash, lease_seconds=args.lease_seconds,
-            learning_rate=args.learning_rate, new_run_id=f"g1j1.5b-{int(time.time())}",
+            learning_rate=args.learning_rate, new_run_id=f"{run_name}-{int(time.time())}",
             initial_theta=initial_theta,
             loaded=loaded,
         )

@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import re
 import threading
 import time
 import uuid
@@ -17,6 +18,24 @@ import torch
 from safetensors import safe_open
 from safetensors.torch import load as load_safetensors
 from safetensors.torch import save as save_safetensors
+
+
+def model_name(model_id: str) -> str:
+    """'RWKV/RWKV7-G1j-1.5B-20260831' -> 'RWKV7-G1j-1.5B-20260831'."""
+    return model_id.rstrip("/").rsplit("/", 1)[-1]
+
+
+def default_model_dir(model_id: str) -> Path:
+    """Where a local snapshot of this model is expected unless a path is given."""
+    return Path("/workspace") / model_name(model_id)
+
+
+def model_slug(model_id: str) -> str:
+    """A file-name and run-id safe form of the model name, e.g. 'rwkv7-g1j-1.5b-20260831'."""
+    slug = re.sub(r"[^a-z0-9._-]+", "-", model_name(model_id).lower()).strip("-._")
+    if not slug:
+        raise ValueError(f"cannot derive a name from model id {model_id!r}")
+    return slug
 
 
 def canonical_json(value: object) -> bytes:

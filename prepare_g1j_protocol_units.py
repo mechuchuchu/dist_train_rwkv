@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build a small immutable, pre-tokenized G1j SFT shard for protocol runs."""
+"""Build a small immutable, pre-tokenized RWKV7 SFT shard for protocol runs."""
 
 from __future__ import annotations
 
@@ -12,9 +12,8 @@ from datasets import load_dataset
 from transformers import AutoTokenizer
 
 
-MODEL_ID = "RWKV/RWKV7-G1j-1.5B-20260831"
-MODEL_REVISION = "2c18b29ab7fbece25ff6112281eea0fa41fcb30f"
-MODEL_PATH = Path("/workspace/RWKV7-G1j-1.5B-20260831")
+DEFAULT_MODEL_ID = "RWKV/RWKV7-G1j-1.5B-20260831"
+DEFAULT_MODEL_REVISION = "2c18b29ab7fbece25ff6112281eea0fa41fcb30f"
 DATASET_ID = "trl-lib/Capybara"
 DATASET_REVISION = "e235e846458bff3398a88aed812347f7f0756520"
 ROW_IDS = [1, 16, 21, 25]
@@ -41,14 +40,21 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path, default=Path("runs/g1j_local_protocol/units.json"))
     parser.add_argument("--max-length", type=int, default=192)
+    parser.add_argument("--model-id", default=DEFAULT_MODEL_ID,
+                        help="base model repository whose tokenizer is used (default: %(default)s)")
+    parser.add_argument("--model-revision", default=DEFAULT_MODEL_REVISION,
+                        help="immutable commit hash of --model-id")
+    parser.add_argument("--model-path", type=Path, default=None,
+                        help="local snapshot of the model (default: /workspace/<model name>)")
     args = parser.parse_args()
-    if not (MODEL_PATH / "tokenizer.json").is_file():
-        raise FileNotFoundError(f"Missing local model/tokenizer: {MODEL_PATH}")
+    model_path = args.model_path or Path("/workspace") / args.model_id.rstrip("/").rsplit("/", 1)[-1]
+    if not (model_path / "tokenizer.json").is_file():
+        raise FileNotFoundError(f"Missing local model/tokenizer: {model_path}")
     if args.max_length < 2:
         raise ValueError("--max-length must be at least 2")
 
     tokenizer = AutoTokenizer.from_pretrained(
-        str(MODEL_PATH), trust_remote_code=True, local_files_only=True
+        str(model_path), trust_remote_code=True, local_files_only=True
     )
     dataset = load_dataset(
         DATASET_ID,
@@ -83,9 +89,9 @@ def main() -> None:
     manifest = {
         "schema_version": SCHEMA_VERSION,
         "model": {
-            "repo": MODEL_ID,
-            "revision": MODEL_REVISION,
-            "release_manifest_sha256": file_sha256(MODEL_PATH / "release-manifest.json"),
+            "repo": args.model_id,
+            "revision": args.model_revision,
+            "release_manifest_sha256": file_sha256(model_path / "release-manifest.json"),
         },
         "dataset": {
             "repo": DATASET_ID,
@@ -94,7 +100,7 @@ def main() -> None:
             "row_ids": ROW_IDS,
         },
         "tokenizer": {
-            "tokenizer_json_sha256": file_sha256(MODEL_PATH / "tokenizer.json"),
+            "tokenizer_json_sha256": file_sha256(model_path / "tokenizer.json"),
             "chat_template_sha256": sha256((tokenizer.chat_template or "").encode()),
             "max_length": args.max_length,
             "assistant_only_loss": True,

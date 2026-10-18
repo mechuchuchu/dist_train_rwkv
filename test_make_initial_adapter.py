@@ -1,9 +1,10 @@
 """make_initial_adapter.py against real PEFT and a stand-in for the RWKV base.
 
 The base model itself is not available on CPU, but the script only needs its
-module structure: 24 layers whose `att` block holds receptance/key/value/output
-projections of width 2048 (the sizes behind the protocol's 192-tensor,
-3,145,728-parameter schema). The stand-in has exactly that structure, with
+module structure: N layers whose `att` block holds receptance/key/value/output
+projections of one width. The default is 24 layers of 2048 (the 1.5B model's
+192-tensor, 3,145,728-parameter schema); other sizes (2.9B: 32x2560, 7.2B:
+32x4096) are built the same way. The stand-in has that structure, with
 uninitialised bf16 weights so it costs almost no memory, and is returned from
 `AutoModelForCausalLM.from_pretrained` so the worker's own `load_worker_model`
 runs unchanged on top of real PEFT.
@@ -16,6 +17,7 @@ from __future__ import annotations
 import contextlib
 import io
 import json
+import os
 import sys
 import tempfile
 import unittest
@@ -61,11 +63,19 @@ except ImportError as exc:  # transformers / peft not installed
     SKIP = f"needs transformers and peft: {exc}"
 
 HIDDEN = 2048
+OTHER_ID = "RWKV/RWKV7-G1k-2.9B-20260930"
+OTHER_REVISION = "0123456789abcdef0123456789abcdef01234567"
+# name -> (layers, hidden size, LoRA tensors, LoRA parameters)
+SIZES = {
+    "1.5B": (24, 2048, 192, 3_145_728),
+    "2.9B": (32, 2560, 256, 5_242_880),
+    "7.2B": (32, 4096, 256, 8_388_608),
+}
 
 
-def projection() -> nn.Linear:
+def projection(hidden: int) -> nn.Linear:
     # Uninitialised: the base weights are never read, only their shapes.
-    return nn.utils.skip_init(nn.Linear, HIDDEN, HIDDEN, bias=False, dtype=torch.bfloat16)
+    return nn.utils.skip_init(nn.Linear, hidden, hidden, bias=False, dtype=torch.bfloat16)
 
 
 if SKIP is None:
@@ -73,36 +83,37 @@ if SKIP is None:
         model_type = "rwkv-structure-standin"
 
     class Attention(nn.Module):
-        def __init__(self):
+        def __init__(self, hidden: int):
             super().__init__()
-            self.receptance, self.key = projection(), projection()
-            self.value, self.output = projection(), projection()
+            self.receptance, self.key = projection(hidden), projection(hidden)
+            self.value, self.output = projection(hidden), projection(hidden)
 
     class FeedForward(nn.Module):
-        # Also has a `key`/`value`: only `att.*` may be picked up.
-        def __init__(self):
+        # Also has a `key`/`value`: only `att.*` may be picked up. Their size is irrelevant.
+        def __init__(self, hidden: int):
             super().__init__()
-            self.key, self.value = projection(), projection()
+            self.key = nn.utils.skip_init(nn.Linear, hidden, 4, bias=False, dtype=torch.bfloat16)
+            self.value = nn.utils.skip_init(nn.Linear, 4, hidden, bias=False, dtype=torch.bfloat16)
 
     class Block(GradientCheckpointingLayer):
-        def __init__(self):
+        def __init__(self, hidden: int):
             super().__init__()
-            self.att, self.ffn = Attention(), FeedForward()
+            self.att, self.ffn = Attention(hidden), FeedForward(hidden)
 
     class Backbone(nn.Module):
-        def __init__(self, layers: int):
+        def __init__(self, layers: int, hidden: int):
             super().__init__()
-            self.embeddings = nn.Embedding(8, HIDDEN, dtype=torch.bfloat16)
-            self.layers = nn.ModuleList(Block() for _ in range(layers))
+            self.embeddings = nn.Embedding(8, hidden, dtype=torch.bfloat16)
+            self.layers = nn.ModuleList(Block(hidden) for _ in range(layers))
 
     class StandInModel(PreTrainedModel, GenerationMixin):
         config_class = StandInConfig
         supports_gradient_checkpointing = True
 
-        def __init__(self, config, layers: int = 24):
+        def __init__(self, config, layers: int = 24, hidden: int = HIDDEN):
             super().__init__(config)
-            self.model = Backbone(layers)
-            self.lm_head = nn.Linear(HIDDEN, 8, bias=False, dtype=torch.bfloat16)
+            self.model = Backbone(layers, hidden)
+            self.lm_head = nn.Linear(hidden, 8, bias=False, dtype=torch.bfloat16)
 
         def get_input_embeddings(self):
             return self.model.embeddings
@@ -117,8 +128,9 @@ if SKIP is None:
 class FakeLoader:
     """Stands in for AutoModelForCausalLM.from_pretrained."""
 
-    def __init__(self, layers: int = 24, draw_random: int = 0, fail: bool = False):
-        self.layers, self.draw_random, self.fail = layers, draw_random, fail
+    def __init__(self, layers: int = 24, hidden: int = HIDDEN, draw_random: int = 0,
+                 fail: bool = False):
+        self.layers, self.hidden, self.draw_random, self.fail = layers, hidden, draw_random, fail
         self.calls: list[tuple[str, dict]] = []
 
     def __call__(self, path, **kwargs):
@@ -127,7 +139,7 @@ class FakeLoader:
             raise OSError("model files are unreadable")
         if self.draw_random:
             torch.rand(self.draw_random)  # a loader that consumes the global RNG
-        model = StandInModel(StandInConfig(), layers=self.layers)
+        model = StandInModel(StandInConfig(), layers=self.layers, hidden=self.hidden)
         model.name_or_path = str(path)
         return model
 
@@ -143,15 +155,23 @@ class InitialAdapterTests(unittest.TestCase):
     def tearDown(self):
         self.tmp.cleanup()
 
-    def build(self, loader=None, seed=7, out=None, force=False):
+    def build(self, loader=None, seed=7, out=None, force=False, **identity):
         loader = loader or FakeLoader()
         with patch.object(WORKER.AutoModelForCausalLM, "from_pretrained", loader), \
                 warnings.catch_warnings():
             # PEFT looks for the base model's config.json when saving; the stand-in has none.
             warnings.filterwarnings("ignore", message="Could not find a config file")
             record = SCRIPT.build_initial_adapter(
-                self.base, out or self.out, seed=seed, force=force)
+                self.base, out or self.out, seed=seed, force=force, **identity)
         return record, loader
+
+    def write_model_files(self, layers: int, hidden: int, release_manifest: bytes | None = b"{}"):
+        """The files of a snapshot the script reads: config.json and release-manifest.json."""
+        self.base.mkdir(exist_ok=True)
+        (self.base / "config.json").write_text(json.dumps(
+            {"num_hidden_layers": layers, "hidden_size": hidden}))
+        if release_manifest is not None:
+            (self.base / "release-manifest.json").write_bytes(release_manifest)
 
     def leftovers(self):
         return sorted(p.name for p in self.out.parent.iterdir()) if self.out.parent.exists() else []
@@ -246,7 +266,7 @@ class InitialAdapterTests(unittest.TestCase):
         record, _ = self.build()
         on_disk = json.loads((self.out / "adapter_init.json").read_text())
         self.assertEqual(on_disk, record)
-        self.assertEqual(on_disk["base_model"]["revision"], WORKER.MODEL_REVISION)
+        self.assertEqual(on_disk["base_model"]["revision"], WORKER.DEFAULT_MODEL_REVISION)
         self.assertEqual(on_disk["versions"]["peft"], SCRIPT.peft.__version__)
 
     def test_existing_weights_are_not_replaced_without_force(self):
@@ -276,11 +296,92 @@ class InitialAdapterTests(unittest.TestCase):
         self.assertFalse(self.out.exists())
         self.assertEqual(self.leftovers(), [])
 
-    def test_a_model_with_a_different_layer_count_is_not_published(self):
-        with self.assertRaisesRegex(ValueError, "unexpected initial adapter tensor schema"):
+    def test_a_model_that_disagrees_with_its_config_is_not_published(self):
+        # config.json says 24 layers; the loaded model has 23.
+        self.write_model_files(layers=24, hidden=HIDDEN)
+        with self.assertRaisesRegex(ValueError, "23 layers of width 2048.*24 layers of width 2048"):
             self.build(loader=FakeLoader(layers=23))
         self.assertFalse(self.out.exists())
         self.assertEqual(self.leftovers(), [])
+
+    def test_a_model_whose_width_disagrees_with_its_config_is_not_published(self):
+        self.write_model_files(layers=24, hidden=4096)
+        with self.assertRaisesRegex(ValueError, "width 2048.*width 4096"):
+            self.build()
+        self.assertEqual(self.leftovers(), [])
+
+    def test_any_rwkv7_size_gets_the_schema_its_own_dimensions_imply(self):
+        for label, (layers, hidden, tensors, parameters) in SIZES.items():
+            with self.subTest(size=label):
+                out = self.root / f"init-{label}"
+                self.write_model_files(layers, hidden)
+                record, _ = self.build(loader=FakeLoader(layers=layers, hidden=hidden), out=out)
+
+                theta = SCRIPT.load_initial_theta(out, model_shape=(layers, hidden))
+                self.assertEqual((record["tensors"], record["parameters"]), (tensors, parameters))
+                self.assertEqual(len(theta), tensors)
+                self.assertEqual(sum(t.numel() for t in theta.values()), parameters)
+                self.assertEqual({tuple(t.shape) for t in theta.values()},
+                                 {(8, hidden), (hidden, 8)})
+                self.assertIn(f"base_model.model.model.layers.{layers - 1}.att.output.lora_B.default.weight",
+                              theta)
+                self.assertNotIn(f"base_model.model.model.layers.{layers}.att.key.lora_A.default.weight",
+                                 theta)
+                self.check_bounds(theta, hidden)
+
+    def check_bounds(self, theta, hidden):
+        for name, tensor in theta.items():
+            if ".lora_B." in name:
+                self.assertEqual(int(tensor.count_nonzero()), 0, name)
+            else:
+                self.assertLessEqual(float(tensor.abs().max()), hidden ** -0.5 * (1 + 1e-6), name)
+                self.assertGreater(int(tensor.count_nonzero()), 0, name)
+
+    def test_a_worker_of_another_size_applies_its_own_initial_theta(self):
+        layers, hidden = SIZES["2.9B"][:2]
+        self.write_model_files(layers, hidden)
+        self.build(loader=FakeLoader(layers=layers, hidden=hidden))
+        theta = SCRIPT.load_initial_theta(self.out, model_shape=(layers, hidden))
+        with patch.object(WORKER.AutoModelForCausalLM, "from_pretrained",
+                          FakeLoader(layers=layers, hidden=hidden)):
+            model = WORKER.load_worker_model(self.base)
+        params = WORKER.apply_snapshot(model, WORKER.encode_tensors(theta), tensor_map_sha256(theta))
+        self.assertEqual(len(params), layers * 8)
+
+    def test_a_worker_refuses_a_theta_made_for_another_size(self):
+        small = SCRIPT.load_initial_theta(self._built(layers=24, hidden=2048))
+        with patch.object(WORKER.AutoModelForCausalLM, "from_pretrained",
+                          FakeLoader(layers=32, hidden=2560)):
+            model = WORKER.load_worker_model(self.base)
+        with self.assertRaisesRegex(RuntimeError, "schema mismatch"):
+            WORKER.apply_snapshot(model, WORKER.encode_tensors(small), tensor_map_sha256(small))
+
+    def test_a_worker_refuses_the_right_names_with_the_wrong_width(self):
+        wide = SCRIPT.load_initial_theta(self._built(layers=2, hidden=2560))
+        with patch.object(WORKER.AutoModelForCausalLM, "from_pretrained",
+                          FakeLoader(layers=2, hidden=2048)):
+            model = WORKER.load_worker_model(self.base)
+        with self.assertRaisesRegex(RuntimeError, "shape mismatch"):
+            WORKER.apply_snapshot(model, WORKER.encode_tensors(wide), tensor_map_sha256(wide))
+
+    def _built(self, layers, hidden):
+        out = self.root / f"built-{layers}x{hidden}"
+        self.build(loader=FakeLoader(layers=layers, hidden=hidden), out=out)
+        return out
+
+    def test_the_record_names_the_model_and_the_hash_of_its_release_manifest(self):
+        self.write_model_files(24, HIDDEN, release_manifest=b'{"conversion": {}}')
+        record, _ = self.build(model_id=OTHER_ID, model_revision=OTHER_REVISION)
+        base = record["base_model"]
+        self.assertEqual((base["repo"], base["revision"]), (OTHER_ID, OTHER_REVISION))
+        self.assertEqual(base["release_manifest_sha256"],
+                         SCRIPT.sha256_bytes(b'{"conversion": {}}'))
+        self.assertEqual(json.loads((self.out / "adapter_init.json").read_text()), record)
+
+    def test_the_record_says_so_when_the_snapshot_has_no_release_manifest(self):
+        self.write_model_files(24, HIDDEN, release_manifest=None)
+        record, _ = self.build()
+        self.assertIsNone(record["base_model"]["release_manifest_sha256"])
 
     def test_non_float32_adapter_tensors_are_refused(self):
         real = WORKER.trainable_parameters
@@ -377,6 +478,30 @@ class InitialAdapterTests(unittest.TestCase):
         self.assertIn(f"theta_hash {record['theta_hash']}", out)
         self.assertIn(f"--initial-adapter-dir {self.out}", out)
         self.assertIn("192 tensors", out)
+
+    def test_main_records_the_model_it_was_given(self):
+        self.base.mkdir()
+        code, _, _ = self.run_main("--base-model", str(self.base), "--output-dir", str(self.out),
+                                   "--model-id", OTHER_ID, "--model-revision", OTHER_REVISION)
+        self.assertEqual(code, 0)
+        base = json.loads((self.out / "adapter_init.json").read_text())["base_model"]
+        self.assertEqual((base["repo"], base["revision"]), (OTHER_ID, OTHER_REVISION))
+
+    def test_main_derives_the_default_locations_from_the_model_id(self):
+        code, _, err = self.run_main("--model-id", OTHER_ID)
+        self.assertEqual(code, 2)
+        self.assertIn("/workspace/RWKV7-G1k-2.9B-20260930", err)
+
+        self.base.mkdir()
+        previous = os.getcwd()
+        os.chdir(self.root)
+        self.addCleanup(os.chdir, previous)
+        code, out, _ = self.run_main("--base-model", str(self.base), "--model-id", OTHER_ID,
+                                     "--model-revision", OTHER_REVISION)
+        self.assertEqual(code, 0)
+        folder = Path("artifacts") / "rwkv7-g1k-2.9b-20260930_lora_init"
+        self.assertTrue((self.root / folder / "adapter_model.safetensors").is_file())
+        self.assertIn(f"--initial-adapter-dir {folder}", out)
 
     def test_main_without_cuda_fails_before_touching_the_output(self):
         self.base.mkdir()

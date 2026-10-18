@@ -34,6 +34,7 @@ from rwkv_dist_client import (
 )
 from rwkv_dist_protocol import (
     decode_tensors,
+    default_model_dir,
     encode_tensors,
     sha256_bytes,
     tensor_map_sha256,
@@ -42,9 +43,11 @@ from rwkv_dist_protocol import (
 from rwkv_hub import ensure_hf_checkpoint
 
 
-MODEL_ID = "RWKV/RWKV7-G1j-1.5B-20260831"
-MODEL_REVISION = "2c18b29ab7fbece25ff6112281eea0fa41fcb30f"
-MODEL_PATH = Path("/workspace/RWKV7-G1j-1.5B-20260831")
+# The model a worker serves unless --model-id/--model-revision say otherwise. The
+# worker only joins a coordinator running exactly this model (it never takes the
+# model to load from the coordinator, because the model's code is executed).
+DEFAULT_MODEL_ID = "RWKV/RWKV7-G1j-1.5B-20260831"
+DEFAULT_MODEL_REVISION = "2c18b29ab7fbece25ff6112281eea0fa41fcb30f"
 TARGET_MODULES = ["att.receptance", "att.key", "att.value", "att.output"]
 
 
@@ -154,7 +157,13 @@ def main() -> None:
     parser.add_argument("--server", default="http://127.0.0.1:17821")
     parser.add_argument("--token", default=os.environ.get("RWKV_PROTOCOL_TOKEN"))
     parser.add_argument("--worker-id", default=f"worker-{os.getpid()}")
-    parser.add_argument("--model-path", type=Path, default=MODEL_PATH)
+    parser.add_argument("--model-id", default=DEFAULT_MODEL_ID,
+                        help="base model repository; must be the one the coordinator runs "
+                             "(default: %(default)s)")
+    parser.add_argument("--model-revision", default=DEFAULT_MODEL_REVISION,
+                        help="immutable commit hash of --model-id; must match the coordinator's")
+    parser.add_argument("--model-path", type=Path, default=None,
+                        help="local snapshot of the model (default: /workspace/<model name>)")
     parser.add_argument("--fetch-model-from-hf", action="store_true",
                         help="download the pinned model revision to --model-path before loading")
     parser.add_argument("--hf-cache-dir", type=Path, default=None)
@@ -165,6 +174,8 @@ def main() -> None:
     args = parser.parse_args()
     if not args.token:
         parser.error("set --token or RWKV_PROTOCOL_TOKEN")
+    if args.model_path is None:
+        args.model_path = default_model_dir(args.model_id)
     if not torch.cuda.is_available():
         raise RuntimeError("worker requires a CUDA GPU")
 
@@ -187,14 +198,18 @@ def main() -> None:
     bundle_hash = bundle_sha256(Path(__file__).parent)
     descriptor = waiter.get_json("/round")
     run_id = descriptor["run_id"]
-    if descriptor["base"]["repo"] != MODEL_ID or descriptor["base"]["revision"] != MODEL_REVISION:
-        raise RuntimeError("coordinator base model identity does not match this worker")
+    if descriptor["base"]["repo"] != args.model_id or descriptor["base"]["revision"] != args.model_revision:
+        raise RuntimeError(
+            f"coordinator trains {descriptor['base']['repo']}@{descriptor['base']['revision']}, but this "
+            f"worker was started for {args.model_id}@{args.model_revision}; pass the coordinator's "
+            f"--model-id/--model-revision"
+        )
     if descriptor["worker_code_sha256"] != bundle_hash:
         raise RuntimeError("worker bundle hash does not match coordinator's pinned code")
     query = urllib.parse.urlencode({"worker_id": args.worker_id})
     waiter.get_json(f"/join?{query}")
     model_path = ensure_hf_checkpoint(
-        MODEL_ID, MODEL_REVISION, args.model_path,
+        args.model_id, args.model_revision, args.model_path,
         fetch_from_hf=args.fetch_model_from_hf,
         token=False,
         cache_dir=args.hf_cache_dir,
@@ -207,7 +222,7 @@ def main() -> None:
         print(json.dumps({"status": "training_complete", "run_id": run_id}), flush=True)
         return
 
-    print(f"loading {MODEL_ID} on {torch.cuda.get_device_name(0)}", flush=True)
+    print(f"loading {args.model_id} on {torch.cuda.get_device_name(0)}", flush=True)
     model = load_worker_model(model_path)
     params = trainable_parameters(model)
     loaded_theta_hash = None

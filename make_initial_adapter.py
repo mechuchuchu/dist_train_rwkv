@@ -11,9 +11,11 @@ Kaiming-uniform(a=sqrt(5)) and every lora_B is zero, so the adapted model is
 exactly the base model before the first optimizer step. Values depend only on
 --seed and the tensor shapes, not on how the base model happened to load.
 
-The base model is only used for its module structure, but the worker's loader
-puts it on cuda:0, so run this where a worker runs and copy the directory to
-the coordinator host if that is a different machine.
+Works for any RWKV7 size (--model-id/--model-revision, --base-model): the layer
+count and width come from the model itself. The base model is only used for its
+module structure, but the worker's loader puts it on cuda:0, so run this where a
+worker runs and copy the directory to the coordinator host if that is a
+different machine.
 """
 
 from __future__ import annotations
@@ -31,15 +33,14 @@ import peft
 import torch
 import transformers
 
-from g1j_dist_coordinator import DEFAULT_INITIAL_ADAPTER_DIR, load_initial_theta
+from g1j_dist_coordinator import default_initial_adapter_dir, load_initial_theta, read_model_shape
 from g1j_dist_worker import (
-    MODEL_ID,
-    MODEL_PATH,
-    MODEL_REVISION,
+    DEFAULT_MODEL_ID,
+    DEFAULT_MODEL_REVISION,
     load_worker_model,
     trainable_parameters,
 )
-from rwkv_dist_protocol import tensor_map_sha256
+from rwkv_dist_protocol import default_model_dir, sha256_bytes, tensor_map_sha256
 
 
 DEFAULT_SEED = 20261018
@@ -90,6 +91,11 @@ def check_clean_init(theta: dict[str, torch.Tensor]) -> None:
                 raise RuntimeError(f"{name} is not a Kaiming-uniform draw (bound {bound:.6g})")
 
 
+def release_manifest_sha256(model_path: Path) -> str | None:
+    manifest = model_path / "release-manifest.json"
+    return sha256_bytes(manifest.read_bytes()) if manifest.is_file() else None
+
+
 def refuse_to_overwrite(output_dir: Path, force: bool) -> None:
     existing = output_dir / WEIGHTS_NAME
     if existing.exists() and not force:
@@ -109,8 +115,9 @@ def publish(stage: Path, output_dir: Path) -> None:
     shutil.rmtree(stage)
 
 
-def build_initial_adapter(model_path: Path, output_dir: Path, *, seed: int,
-                          force: bool = False) -> dict:
+def build_initial_adapter(model_path: Path, output_dir: Path, *, seed: int, force: bool = False,
+                          model_id: str = DEFAULT_MODEL_ID,
+                          model_revision: str = DEFAULT_MODEL_REVISION) -> dict:
     refuse_to_overwrite(output_dir, force)
     output_dir.parent.mkdir(parents=True, exist_ok=True)
     stage = output_dir.parent / f".{output_dir.name}.tmp-{os.getpid()}-{int(time.time())}"
@@ -128,7 +135,7 @@ def build_initial_adapter(model_path: Path, output_dir: Path, *, seed: int,
         model.save_pretrained(str(stage), safe_serialization=True)
 
         # Check the files that were written, with the loader the coordinator will use.
-        theta = load_initial_theta(stage)
+        theta = load_initial_theta(stage, model_shape=read_model_shape(model_path))
         check_matches_worker(theta, params)
         check_clean_init(theta)
         theta_hash = tensor_map_sha256(theta)
@@ -138,7 +145,10 @@ def build_initial_adapter(model_path: Path, output_dir: Path, *, seed: int,
             "tensors": len(theta),
             "parameters": sum(t.numel() for t in theta.values()),
             "init": "lora_A kaiming_uniform(a=sqrt(5)), lora_B zeros",
-            "base_model": {"repo": MODEL_ID, "revision": MODEL_REVISION, "path": str(model_path)},
+            "base_model": {
+                "repo": model_id, "revision": model_revision, "path": str(model_path),
+                "release_manifest_sha256": release_manifest_sha256(model_path),
+            },
             "versions": {"torch": torch.__version__, "transformers": transformers.__version__,
                          "peft": peft.__version__},
         }
@@ -152,17 +162,25 @@ def build_initial_adapter(model_path: Path, output_dir: Path, *, seed: int,
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    parser.add_argument("--base-model", type=Path, default=MODEL_PATH,
-                        help="local directory of the pinned base model (default: %(default)s)")
-    parser.add_argument("--output-dir", type=Path, default=DEFAULT_INITIAL_ADAPTER_DIR,
-                        help="where to write the adapter; the coordinator's "
-                             "--initial-adapter-dir default (default: %(default)s)")
+    parser.add_argument("--model-id", default=DEFAULT_MODEL_ID,
+                        help="base model repository, recorded with the adapter (default: %(default)s)")
+    parser.add_argument("--model-revision", default=DEFAULT_MODEL_REVISION,
+                        help="immutable commit hash of --model-id, recorded with the adapter")
+    parser.add_argument("--base-model", type=Path, default=None,
+                        help="local directory of the base model (default: /workspace/<model name>)")
+    parser.add_argument("--output-dir", type=Path, default=None,
+                        help="where to write the adapter; the coordinator's --initial-adapter-dir "
+                             "default (default: artifacts/<model name>_lora_init)")
     parser.add_argument("--seed", type=int, default=DEFAULT_SEED,
                         help="seed for the lora_A draw (default: %(default)s)")
     parser.add_argument("--force", action="store_true",
                         help=f"replace an existing {WEIGHTS_NAME}")
     args = parser.parse_args(argv)
 
+    if args.base_model is None:
+        args.base_model = default_model_dir(args.model_id)
+    if args.output_dir is None:
+        args.output_dir = default_initial_adapter_dir(args.model_id)
     if not torch.cuda.is_available():
         parser.error("CUDA is required: the worker's model loader places the base on cuda:0. "
                      "Run this on a worker machine and copy the directory to the coordinator host")
@@ -174,11 +192,13 @@ def main(argv: list[str] | None = None) -> int:
         parser.error(str(exc))
 
     record = build_initial_adapter(args.base_model, args.output_dir, seed=args.seed,
-                                   force=args.force)
+                                   force=args.force, model_id=args.model_id,
+                                   model_revision=args.model_revision)
     print(f"wrote {args.output_dir}: {record['tensors']} tensors, "
           f"{record['parameters']:,} parameters, seed {record['seed']}")
     print(f"theta_hash {record['theta_hash']}")
-    print(f"start the coordinator with --initial-adapter-dir {args.output_dir}")
+    print(f"start the coordinator with --initial-adapter-dir {args.output_dir} "
+          f"(same --model-id/--model-revision as above)")
     return 0
 
 

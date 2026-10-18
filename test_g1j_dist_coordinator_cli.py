@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import io
 import json
+import shutil
 import sys
 import tempfile
 import unittest
@@ -36,25 +37,38 @@ class ReturningServer:
         pass
 
 
-def write_initial_adapter(directory: Path) -> None:
+def write_initial_adapter(directory: Path, layers: int = 24, hidden: int = 2048) -> None:
     directory.mkdir(parents=True)
     (directory / "adapter_config.json").write_text(json.dumps({
         "r": 8, "lora_alpha": 16, "base_model_name_or_path": "/local/base",
     }))
     tensors = {}
-    for layer in range(24):
+    for layer in range(layers):
         for module in ("receptance", "key", "value", "output"):
             prefix = f"base_model.model.model.layers.{layer}.att.{module}"
-            tensors[f"{prefix}.lora_A.weight"] = torch.zeros((8, 2048))
-            tensors[f"{prefix}.lora_B.weight"] = torch.zeros((2048, 8))
+            tensors[f"{prefix}.lora_A.weight"] = torch.zeros((8, hidden))
+            tensors[f"{prefix}.lora_B.weight"] = torch.zeros((hidden, 8))
     save_file(tensors, str(directory / "adapter_model.safetensors"))
 
 
-def write_fixtures(root: Path) -> dict[str, Path]:
+def write_fixtures(root: Path, *, layers: int = 24, hidden: int = 2048,
+                   model_id: str = coordinator_module.DEFAULT_MODEL_ID,
+                   revision: str = coordinator_module.DEFAULT_MODEL_REVISION,
+                   config: bool = True, adapter_shape: tuple[int, int] | None = None
+                   ) -> dict[str, Path]:
+    """A model snapshot of `layers` x `hidden`, a shard made for it, and a matching adapter.
+
+    `adapter_shape` builds the starting adapter for a different size, to test the mismatch.
+    """
+    root.mkdir(parents=True, exist_ok=True)
     model_dir = root / "model"
     model_dir.mkdir()
-    release = json.dumps({"conversion": {"serialized_parameter_count": 123}}).encode()
+    release = json.dumps({"conversion": {"serialized_parameter_count": 123},
+                          "model": model_id}).encode()
     (model_dir / "release-manifest.json").write_bytes(release)
+    if config:
+        (model_dir / "config.json").write_text(json.dumps(
+            {"num_hidden_layers": layers, "hidden_size": hidden}))
     units = []
     for index in range(6):
         unit = {"unit_id": f"u{index}", "input_ids": [1, 2], "labels": [-100, 2],
@@ -63,8 +77,8 @@ def write_fixtures(root: Path) -> dict[str, Path]:
         units.append(unit)
     content = {
         "model": {
-            "repo": coordinator_module.MODEL_ID,
-            "revision": coordinator_module.MODEL_REVISION,
+            "repo": model_id,
+            "revision": revision,
             "release_manifest_sha256": sha256_bytes(release),
         },
         "tokenizer": {"name": "test-tokenizer"},
@@ -74,7 +88,7 @@ def write_fixtures(root: Path) -> dict[str, Path]:
     units_path = root / "units.json"
     units_path.write_text(json.dumps(manifest))
     adapter_dir = root / "initial-adapter"
-    write_initial_adapter(adapter_dir)
+    write_initial_adapter(adapter_dir, *(adapter_shape or (layers, hidden)))
     return {"units": units_path, "model": model_dir, "adapter": adapter_dir}
 
 
@@ -85,12 +99,15 @@ class CoordinatorCommandLineTests(unittest.TestCase):
         self.root = Path(self.temp.name)
         self.fixtures = write_fixtures(self.root)
 
-    def run_main(self, run_dir: Path, *extra: str) -> tuple[dict, str]:
-        """Run main() and return (the status line it printed, everything else it printed)."""
+    def run_main(self, run_dir: Path, *extra: str, defaults: bool = True) -> tuple[dict, str]:
+        """Run main() and return (the status line it printed, everything else it printed).
+
+        With defaults=False the model and adapter locations are left to the program.
+        """
+        located = ["--model-dir", str(self.fixtures["model"]),
+                   "--initial-adapter-dir", str(self.fixtures["adapter"])] if defaults else []
         argv = [
-            "g1j_dist_coordinator.py", "--units", str(self.fixtures["units"]),
-            "--model-dir", str(self.fixtures["model"]),
-            "--initial-adapter-dir", str(self.fixtures["adapter"]),
+            "g1j_dist_coordinator.py", "--units", str(self.fixtures["units"]), *located,
             "--run-dir", str(run_dir), "--token", "protocol-token", "--port", "0",
             "--units-per-step", "2", "--min-units-per-step", "2", *extra,
         ]
@@ -103,10 +120,10 @@ class CoordinatorCommandLineTests(unittest.TestCase):
         start = text.index('{\n  "listen"')
         return json.loads(text[start:]), text[:start]
 
-    def refused(self, run_dir: Path, *extra: str) -> str:
+    def refused(self, run_dir: Path, *extra: str, **options) -> str:
         errors = io.StringIO()
         with redirect_stderr(errors), self.assertRaises(SystemExit) as caught:
-            self.run_main(run_dir, *extra)
+            self.run_main(run_dir, *extra, **options)
         self.assertEqual(caught.exception.code, 2)
         return errors.getvalue()
 
@@ -141,13 +158,160 @@ class CoordinatorCommandLineTests(unittest.TestCase):
         self.assertIn("rank 8 / alpha 16", self.refused(self.root / "run"))
 
     def test_the_default_initial_adapter_dir_is_the_one_the_script_writes(self):
-        argv = ["g1j_dist_coordinator.py", "--help"]
-        output = io.StringIO()
-        with patch.object(sys, "argv", argv), redirect_stdout(output), \
-                self.assertRaises(SystemExit):
-            coordinator_module.main()
-        self.assertIn(str(coordinator_module.DEFAULT_INITIAL_ADAPTER_DIR),
-                      output.getvalue().replace("\n", "").replace(" ", ""))
+        # Neither location is given: the adapter folder is derived from the model name,
+        # which is also where make_initial_adapter.py writes by default.
+        message = self.refused(self.root / "run", "--model-dir", str(self.fixtures["model"]),
+                               defaults=False)
+        derived = coordinator_module.default_initial_adapter_dir(coordinator_module.DEFAULT_MODEL_ID)
+        self.assertEqual(derived, Path("artifacts/rwkv7-g1j-1.5b-20260831_lora_init"))
+        self.assertIn(f"cannot start from {derived}", message)
+        self.assertIn(f"--output-dir {derived}", message)
+
+    def test_the_missing_adapter_hint_names_the_model_it_is_for(self):
+        shutil.rmtree(self.fixtures["adapter"])
+        message = self.refused(self.root / "run")
+        self.assertIn(f"--model-id {coordinator_module.DEFAULT_MODEL_ID}", message)
+        self.assertIn(f"--model-revision {coordinator_module.DEFAULT_MODEL_REVISION}", message)
+        self.assertIn(f"--base-model {self.fixtures['model']}", message)
+
+    # --- other models -------------------------------------------------------------------
+
+    OTHER_ID = "RWKV/RWKV7-G1k-2.9B-20260930"
+    OTHER_REVISION = "0123456789abcdef0123456789abcdef01234567"
+
+    def use_model(self, name: str, **options) -> list[str]:
+        """Switch to fixtures for another model; return the flags that select it."""
+        model_id = options.setdefault("model_id", self.OTHER_ID)
+        revision = options.setdefault("revision", self.OTHER_REVISION)
+        self.fixtures = write_fixtures(self.root / name, **options)
+        return ["--model-id", model_id, "--model-revision", revision]
+
+    def test_other_model_sizes_start_from_a_matching_adapter(self):
+        sizes = {"2.9B": (32, 2560), "7.2B": (32, 4096), "13.3B": (61, 4096)}
+        for label, (layers, hidden) in sizes.items():
+            with self.subTest(size=label):
+                flags = self.use_model(label, layers=layers, hidden=hidden)
+                status, _ = self.run_main(self.root / f"run-{label}", *flags)
+
+                self.assertEqual(status["model_id"], self.OTHER_ID)
+                self.assertEqual(status["model_revision"], self.OTHER_REVISION)
+                self.assertTrue(status["run_id"].startswith("rwkv7-g1k-2.9b-20260930-"), status["run_id"])
+                theta = load_latest_checkpoint(self.root / f"run-{label}" / "ckpt").theta
+                self.assertEqual(len(theta), layers * 8)
+                self.assertEqual(sum(t.numel() for t in theta.values()), layers * 64 * hidden)
+                shapes = {tuple(t.shape) for t in theta.values()}
+                self.assertEqual(shapes, {(8, hidden), (hidden, 8)})
+
+    def test_the_run_records_which_model_it_trains(self):
+        flags = self.use_model("other", layers=32, hidden=2560)
+        self.run_main(self.root / "run", *flags)
+        state = load_latest_checkpoint(self.root / "run" / "ckpt").state
+        self.assertEqual(state["base"]["repo"], self.OTHER_ID)
+        self.assertEqual(state["base"]["revision"], self.OTHER_REVISION)
+
+    def test_an_adapter_made_for_another_size_is_refused_with_both_sizes(self):
+        flags = self.use_model("mismatch", layers=32, hidden=2560, adapter_shape=(24, 2048))
+        message = self.refused(self.root / "run", *flags)
+        self.assertIn("24 layers of width 2048", message)
+        self.assertIn("32 layers of width 2560", message)
+        self.assertFalse((self.root / "run" / "ckpt").exists())
+
+    def test_an_adapter_with_the_right_layers_but_another_width_is_refused(self):
+        flags = self.use_model("mismatch", layers=32, hidden=4096, adapter_shape=(32, 2560))
+        self.assertIn("32 layers of width 2560", self.refused(self.root / "run", *flags))
+
+    def test_an_incomplete_adapter_is_refused_whatever_the_model(self):
+        flags = self.use_model("partial", layers=32, hidden=2560)
+        write_initial_adapter(self.root / "partial-adapter", layers=31, hidden=2560)
+        self.fixtures["adapter"] = self.root / "partial-adapter"
+        # 31 layers is a valid adapter for a 31-layer model, so it is the config that rejects it.
+        self.assertIn("31 layers of width 2560", self.refused(self.root / "run", *flags))
+
+    def test_a_snapshot_without_config_json_still_starts_but_says_it_cannot_check_the_size(self):
+        flags = self.use_model("noconfig", layers=32, hidden=2560, config=False)
+        status, printed = self.run_main(self.root / "run", *flags)
+        self.assertEqual(status["model_id"], self.OTHER_ID)
+        self.assertIn("config.json not found", printed)
+        self.assertIn("workers verify the exact tensor names and shapes", printed)
+
+    def test_a_config_without_the_model_size_is_refused(self):
+        flags = self.use_model("badconfig", layers=32, hidden=2560)
+        (self.fixtures["model"] / "config.json").write_text(json.dumps({"hidden_size": 2560}))
+        self.assertIn("num_hidden_layers", self.refused(self.root / "run", *flags))
+
+    def test_the_default_model_location_follows_the_model_id(self):
+        flags = self.use_model("other", layers=32, hidden=2560)
+        seen = []
+
+        def fake_ensure(model_id, revision, model_dir, **kwargs):
+            seen.append((model_id, revision, model_dir))
+            return self.fixtures["model"]
+
+        with patch.object(coordinator_module, "ensure_hf_checkpoint", fake_ensure):
+            self.run_main(self.root / "run", *flags, "--initial-adapter-dir",
+                          str(self.fixtures["adapter"]), defaults=False)
+        self.assertEqual(seen, [(self.OTHER_ID, self.OTHER_REVISION,
+                                 Path("/workspace/RWKV7-G1k-2.9B-20260930"))])
+
+    def test_an_explicit_model_dir_overrides_the_default_location(self):
+        seen = []
+
+        def fake_ensure(model_id, revision, model_dir, **kwargs):
+            seen.append(model_dir)
+            return self.fixtures["model"]
+
+        with patch.object(coordinator_module, "ensure_hf_checkpoint", fake_ensure):
+            self.run_main(self.root / "run")
+        self.assertEqual(seen, [self.fixtures["model"]])
+
+    def test_a_shard_tokenized_for_another_model_is_refused(self):
+        # The shard says RWKV7-G1j; the run asks for G1k, or for another commit of G1j.
+        wrong_model = ["--model-id", self.OTHER_ID]
+        self.assertIn("tokenized shard was made for", self.refused(self.root / "a", *wrong_model))
+        wrong_commit = ["--model-revision", self.OTHER_REVISION]
+        message = self.refused(self.root / "b", *wrong_commit)
+        self.assertIn("tokenized shard was made for", message)
+        self.assertIn(coordinator_module.DEFAULT_MODEL_REVISION, message)
+        self.assertIn(self.OTHER_REVISION, message)
+
+    def test_a_branch_or_tag_is_not_accepted_as_a_model_revision(self):
+        for revision in ("main", "2c18b29", "2C18B29AB7FBECE25FF6112281EEA0FA41FCB30F"):
+            with self.subTest(revision=revision):
+                self.assertIn("40-character commit hash",
+                              self.refused(self.root / "run", "--model-revision", revision))
+
+    def test_a_model_id_without_a_usable_name_is_a_usage_error(self):
+        self.assertIn("cannot derive a name", self.refused(self.root / "run", "--model-id", "/"))
+
+    def test_a_bad_units_file_is_a_usage_error_not_a_traceback(self):
+        manifest = json.loads(self.fixtures["units"].read_text())
+        without_model = {k: v for k, v in manifest.items() if k not in ("model", "manifest_sha256")}
+        without_model["manifest_sha256"] = sha256_bytes(canonical_json(without_model))
+        no_units = {k: v for k, v in manifest.items() if k not in ("units", "manifest_sha256")}
+        no_units["units"] = []
+        no_units["manifest_sha256"] = sha256_bytes(canonical_json(
+            {k: v for k, v in no_units.items() if k != "manifest_sha256"}))
+        cases = {
+            "hash mismatch": {**manifest, "units": manifest["units"][:-1]},
+            "no model": without_model,
+            "no units": no_units,
+        }
+        for name, content in cases.items():
+            with self.subTest(case=name):
+                self.fixtures["units"].write_text(json.dumps(content))
+                self.assertIn("cannot use --units", self.refused(self.root / f"run-{name}"))
+        self.fixtures["units"].write_text("not json")
+        self.assertIn("cannot use --units", self.refused(self.root / "run-text"))
+        self.fixtures["units"].unlink()
+        self.assertIn("cannot use --units", self.refused(self.root / "run-missing"))
+
+    def test_resuming_a_run_with_another_model_is_refused(self):
+        run_dir = self.root / "run"
+        self.run_main(run_dir)
+        flags = self.use_model("other", layers=24, hidden=2048)  # same size, different model
+        message = self.refused(run_dir, "--resume", *flags)
+        self.assertIn("cannot resume", message)
+        self.assertIn("base (checkpoint", message)
 
     def test_resume_continues_the_same_run(self):
         run_dir = self.root / "run"

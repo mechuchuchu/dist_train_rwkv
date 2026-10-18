@@ -56,7 +56,8 @@ T0 = "a" * 64
 T1 = "b" * 64
 
 
-def round_descriptor(theta_hash: str, theta_version: int) -> dict:
+def round_descriptor(theta_hash: str, theta_version: int, *, repo: str | None = None,
+                     revision: str | None = None) -> dict:
     return {
         "run_id": "run-1",
         "round_id": theta_version + 1,
@@ -65,8 +66,8 @@ def round_descriptor(theta_hash: str, theta_version: int) -> dict:
         "status": "open",
         "training_complete": False,
         "base": {
-            "repo": WORKER.MODEL_ID,
-            "revision": WORKER.MODEL_REVISION,
+            "repo": repo or WORKER.DEFAULT_MODEL_ID,
+            "revision": revision or WORKER.DEFAULT_MODEL_REVISION,
             "release_manifest_sha256": MANIFEST_SHA,
         },
         "worker_code_sha256": BUNDLE_SHA,
@@ -125,19 +126,27 @@ class FakeModel:
         return []
 
 
-class WorkerStaleLeaseTests(unittest.TestCase):
-    def run_worker(self, coordinator: ScriptedCoordinator, *, apply_snapshot=None):
+class WorkerHarness:
+    """Runs the real main() against a scripted coordinator."""
+
+    def run_worker(self, coordinator: ScriptedCoordinator, *, apply_snapshot=None,
+                   flags: tuple[str, ...] = (), model_path: bool = True):
+        """Run main(); `flags` are extra arguments, model_path=False leaves --model-path unset."""
         apply_snapshot = apply_snapshot or MagicMock(return_value={})
         with tempfile.TemporaryDirectory() as model_dir:
             (Path(model_dir) / "release-manifest.json").write_bytes(MANIFEST_BYTES)
             argv = ["g1j_dist_worker.py", "--server", "http://coordinator.invalid",
                     "--token", "t", "--worker-id", "w", "--max-units", "1",
-                    "--poll-seconds", "0.01", "--model-path", model_dir]
+                    "--poll-seconds", "0.01", *flags]
+            if model_path:
+                argv += ["--model-path", model_dir]
             output = io.StringIO()
+            self.ensure_checkpoint = MagicMock(return_value=Path(model_dir))
+            self.load_model = MagicMock(return_value=FakeModel())
             with patch.object(sys, "argv", argv), \
                     patch.object(WORKER, "Client", lambda *args, **kwargs: coordinator), \
-                    patch.object(WORKER, "ensure_hf_checkpoint", return_value=Path(model_dir)), \
-                    patch.object(WORKER, "load_worker_model", return_value=FakeModel()), \
+                    patch.object(WORKER, "ensure_hf_checkpoint", self.ensure_checkpoint), \
+                    patch.object(WORKER, "load_worker_model", self.load_model), \
                     patch.object(WORKER, "apply_snapshot", apply_snapshot), \
                     patch.object(WORKER, "compute_unit",
                                  return_value=(b"gradient-bytes", 1.5, 1, 0.5)), \
@@ -151,6 +160,8 @@ class WorkerStaleLeaseTests(unittest.TestCase):
     def accepted_result(self, theta_hash: str) -> dict:
         return {"status": "accepted", "round_closed": True, "theta_hash": theta_hash}
 
+
+class WorkerStaleLeaseTests(WorkerHarness, unittest.TestCase):
     def test_snapshot_header_from_a_newer_round_drops_the_lease_and_resyncs(self):
         # The round closes after /lease but before /snapshot: the header already
         # carries the next adapter version. Previously this killed the worker.
@@ -275,6 +286,94 @@ class WorkerStaleLeaseTests(unittest.TestCase):
         self.assertNotIn("/release", coordinator.calls)
         apply_snapshot.assert_called_once()
         self.assertEqual(coordinator.calls.count("/result"), 1)
+
+
+OTHER_ID = "RWKV/RWKV7-G1k-2.9B-20260930"
+OTHER_REVISION = "0123456789abcdef0123456789abcdef01234567"
+
+
+class WorkerModelSelectionTests(WorkerHarness, unittest.TestCase):
+    """A worker serves exactly the model it was started for; it never takes one from the coordinator."""
+
+    def other_model(self, theta_hash=T0):
+        return round_descriptor(theta_hash, 0, repo=OTHER_ID, revision=OTHER_REVISION)
+
+    def a_complete_unit(self, descriptor):
+        return ScriptedCoordinator(
+            routes={
+                "/round": [descriptor] * 3,
+                "/lease": [leased(T0, 0, "lease-1")],
+                "/snapshot": [snapshot_reply(T0)],
+                "/result": [self.accepted_result(T0)],
+            },
+            sticky={"/join": {"status": "active"}},
+        )
+
+    def refuses(self, descriptor, *flags):
+        coordinator = ScriptedCoordinator(routes={"/round": [descriptor]})
+        with self.assertRaises(RuntimeError) as caught:
+            self.run_worker(coordinator, flags=flags)
+        # It stopped at the first look at the round: no join, no lease, no model code run.
+        self.assertEqual(coordinator.calls, ["/round"])
+        self.load_model.assert_not_called()
+        return str(caught.exception)
+
+    def test_a_worker_started_for_another_model_trains_it(self):
+        coordinator = self.a_complete_unit(self.other_model())
+        flags = ("--model-id", OTHER_ID, "--model-revision", OTHER_REVISION)
+
+        output, _ = self.run_worker(coordinator, flags=flags)
+
+        self.assertIn(f"loading {OTHER_ID}", output)
+        self.assertEqual(coordinator.calls.count("/result"), 1)
+        model_id, revision, _path = self.ensure_checkpoint.call_args.args
+        self.assertEqual((model_id, revision), (OTHER_ID, OTHER_REVISION))
+
+    def test_the_default_model_path_follows_the_model_id(self):
+        coordinator = self.a_complete_unit(self.other_model())
+        flags = ("--model-id", OTHER_ID, "--model-revision", OTHER_REVISION)
+
+        self.run_worker(coordinator, flags=flags, model_path=False)
+
+        self.assertEqual(self.ensure_checkpoint.call_args.args[2],
+                         Path("/workspace/RWKV7-G1k-2.9B-20260930"))
+
+    def test_the_default_worker_still_serves_the_default_model(self):
+        coordinator = self.a_complete_unit(round_descriptor(T0, 0))
+
+        self.run_worker(coordinator, model_path=False)
+
+        self.assertEqual(self.ensure_checkpoint.call_args.args[:2],
+                         (WORKER.DEFAULT_MODEL_ID, WORKER.DEFAULT_MODEL_REVISION))
+        self.assertEqual(self.ensure_checkpoint.call_args.args[2],
+                         Path("/workspace/RWKV7-G1j-1.5B-20260831"))
+
+    def test_a_default_worker_refuses_a_coordinator_training_another_model(self):
+        message = self.refuses(self.other_model())
+        self.assertIn(f"coordinator trains {OTHER_ID}@{OTHER_REVISION}", message)
+        self.assertIn(f"worker was started for {WORKER.DEFAULT_MODEL_ID}@{WORKER.DEFAULT_MODEL_REVISION}",
+                      message)
+        self.assertIn("--model-id/--model-revision", message)
+
+    def test_a_worker_for_another_model_refuses_a_default_coordinator(self):
+        message = self.refuses(round_descriptor(T0, 0),
+                               "--model-id", OTHER_ID, "--model-revision", OTHER_REVISION)
+        self.assertIn(f"worker was started for {OTHER_ID}@{OTHER_REVISION}", message)
+
+    def test_the_same_repository_at_another_commit_is_another_model(self):
+        descriptor = round_descriptor(T0, 0, revision=OTHER_REVISION)
+        self.assertIn(f"{WORKER.DEFAULT_MODEL_ID}@{OTHER_REVISION}", self.refuses(descriptor))
+
+    def test_the_same_commit_under_another_repository_is_another_model(self):
+        descriptor = round_descriptor(T0, 0, repo=OTHER_ID)
+        self.assertIn(f"{OTHER_ID}@{WORKER.DEFAULT_MODEL_REVISION}", self.refuses(descriptor))
+
+    def test_the_model_to_load_is_never_taken_from_the_coordinator(self):
+        # Whatever the coordinator announces, only the worker's own arguments decide what is loaded.
+        coordinator = self.a_complete_unit(round_descriptor(T0, 0))
+        self.run_worker(coordinator, model_path=False)
+        for call in self.ensure_checkpoint.call_args_list:
+            self.assertEqual(call.args[:2], (WORKER.DEFAULT_MODEL_ID, WORKER.DEFAULT_MODEL_REVISION))
 
 
 if __name__ == "__main__":
