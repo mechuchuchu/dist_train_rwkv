@@ -57,6 +57,8 @@ from rwkv_hub import (
 MODEL_ID = "RWKV/RWKV7-G1j-1.5B-20260831"
 MODEL_REVISION = "2c18b29ab7fbece25ff6112281eea0fa41fcb30f"
 MODEL_PATH = Path("/workspace/RWKV7-G1j-1.5B-20260831")
+# Where a fresh run looks for its starting adapter; make_initial_adapter.py writes here.
+DEFAULT_INITIAL_ADAPTER_DIR = Path("artifacts/g1j_1.5b_lora_init")
 def worker_bundle_sha256(root: Path) -> str:
     digest = hashlib.sha256()
     for name in WORKER_BUNDLE_FILES:
@@ -109,6 +111,13 @@ def build_round_plan(
 
 
 def load_initial_theta(adapter_dir: Path) -> dict[str, torch.Tensor]:
+    missing = [name for name in ("adapter_config.json", "adapter_model.safetensors")
+               if not (adapter_dir / name).is_file()]
+    if missing:
+        raise FileNotFoundError(
+            f"initial adapter {adapter_dir} is missing {', '.join(missing)}; create a fresh "
+            f"rank-8 adapter with: python make_initial_adapter.py --output-dir {adapter_dir}"
+        )
     adapter_config = json.loads((adapter_dir / "adapter_config.json").read_text())
     if int(adapter_config.get("r", -1)) != 8 or int(adapter_config.get("lora_alpha", -1)) != 16:
         raise ValueError("initial adapter must be rank 8 / alpha 16")
@@ -965,8 +974,9 @@ def main() -> None:
                              "checkpoints/ in the Hub repository)")
     parser.add_argument("--hf-version", type=int, default=None,
                         help="exact theta version to resume from; default is the newest that verifies")
-    parser.add_argument("--initial-adapter-dir", type=Path,
-                        default=Path("artifacts/g1j_1.5b_capybara_sft_protocol"))
+    parser.add_argument("--initial-adapter-dir", type=Path, default=DEFAULT_INITIAL_ADAPTER_DIR,
+                        help="rank-8 PEFT adapter a fresh run starts from; create one with "
+                             "make_initial_adapter.py (default: %(default)s)")
     parser.add_argument("--run-dir", type=Path, default=Path("runs/g1j_local_protocol/round-0001"))
     parser.add_argument("--bind", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=17821)
@@ -1076,6 +1086,12 @@ def main() -> None:
             print("WARNING: this Hub checkpoint carries no optimizer state; the adapter is restored "
                   "but the Adam moments start cold, so later steps will differ from an "
                   "uninterrupted run.", flush=True)
+    initial_theta = None
+    if loaded is None:
+        try:
+            initial_theta = load_initial_theta(args.initial_adapter_dir)
+        except (FileNotFoundError, ValueError) as exc:
+            parser.error(f"cannot start from {args.initial_adapter_dir}: {exc}")
     worker_hash = worker_bundle_sha256(Path(__file__).parent)
     base = {
         "repo": MODEL_ID,
@@ -1089,7 +1105,7 @@ def main() -> None:
             round_plan=round_plan, plan_sha256=plan_sha256, manifest=manifest, base=base,
             worker_code_sha256=worker_hash, lease_seconds=args.lease_seconds,
             learning_rate=args.learning_rate, new_run_id=f"g1j1.5b-{int(time.time())}",
-            initial_theta=None if loaded else load_initial_theta(args.initial_adapter_dir),
+            initial_theta=initial_theta,
             loaded=loaded,
         )
     except ResumeError as exc:

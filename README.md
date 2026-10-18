@@ -28,7 +28,8 @@ coordinator ───────────────────▶ worker 
 | `rwkv_dist_checkpoint.py` | coordinator 체크포인트(원자적 저장, 검증, 호환성 검사) |
 | `rwkv_hub.py` | Hugging Face 모델 내려받기, adapter push, Hub 체크포인트 조회 |
 | `prepare_g1j_protocol_units.py` | 샘플 unit manifest 생성 (4개 행짜리 프로토콜 검증용) |
-| `validate_g1j_sft_protocol.py` | TRL로 2 step 학습해 초기 adapter를 만드는 검증 스크립트 |
+| `make_initial_adapter.py` | 새 실행의 출발점이 되는 깨끗한 rank-8 LoRA adapter 생성 (CUDA 필요) |
+| `validate_g1j_sft_protocol.py` | TRL로 2 step 학습해 보는 프로토콜 검증 스크립트(adapter도 하나 남김) |
 | `validate_g1j_dist_checkpoint.py` | 결과 adapter가 PEFT로 로드되고 coordinator의 theta와 같은지 확인 |
 | `test_*.py` | 단위/통합 테스트 (CPU) |
 | `*Design*.md`, `G1j_1.5B_Training_Protocol_Validation_*.md`, `VRAM_Baseline_*.md` | 설계, 검증 기록, VRAM 측정 |
@@ -39,6 +40,7 @@ coordinator ───────────────────▶ worker 
 - **Python.** 개발은 PyTorch 2.14.1(cu126), Transformers 5.20.1, PEFT 0.21.2 환경(`/venv/main`)에서 했고, 테스트는 Python 3.13 / CPU 전용 torch에서도 돌려 봤습니다. 더 낮은 Python 버전은 확인하지 않았습니다. 의존성 목록 파일(`requirements.txt`)은 아직 없습니다.
 - **coordinator:** `torch`(CPU면 충분), `safetensors`, `numpy`, `huggingface_hub`(Hub 기능에만). GPU가 필요 없고, 모델 가중치도 필요 없습니다. `--model-dir`에 `release-manifest.json`이 있는 폴더만 있으면 해시 확인에 쓰입니다.
 - **worker:** CUDA GPU, `torch`(CUDA), `transformers`, `peft`, 그리고 BF16 base 모델 스냅샷. 1.5B는 RTX 3060 12 GiB에서 검증했습니다.
+- 초기 adapter 생성(`make_initial_adapter.py`)은 worker와 같은 환경(CUDA, `transformers`, `peft`, base 모델)에서 돌립니다.
 - 데이터 준비/검증 스크립트는 추가로 `datasets`, `trl`이 필요합니다.
 - 모든 요청은 공유 토큰(`Authorization: Bearer ...`)으로 인증합니다. 토큰은 환경 변수 `RWKV_PROTOCOL_TOKEN`으로 넘기는 편이 좋습니다(명령행 인자는 `ps`에 보입니다).
 
@@ -49,13 +51,19 @@ coordinator ───────────────────▶ worker 
 ### 0. 준비물 두 가지
 
 1. **base 모델.** worker 머신에서 `--fetch-model-from-hf`로 고정 revision을 내려받을 수 있습니다(토큰 없이 공개 다운로드). 이미 받아 뒀다면 경로만 지정하세요.
-2. **초기 adapter.** coordinator가 `--initial-adapter-dir`(기본값 `artifacts/g1j_1.5b_capybara_sft_protocol`)에서 `adapter_config.json`과 `adapter_model.safetensors`를 읽습니다. 이 폴더의 설정 파일은 저장소에 있지만 **가중치 파일은 `.gitignore`로 제외돼 있어 새로 클론하면 없습니다.** 검증된 방법은 한 가지입니다.
+2. **초기 adapter.** coordinator는 `--initial-adapter-dir`(기본값 `artifacts/g1j_1.5b_lora_init`)에서 `adapter_config.json`과 `adapter_model.safetensors`를 읽습니다. 가중치 파일은 `.gitignore`로 제외돼 있어 새로 클론하면 없으니 먼저 만드세요.
 
    ```bash
-   python validate_g1j_sft_protocol.py   # CUDA 필요. 4개 행으로 2 step 학습한 adapter를 위 폴더에 저장
+   python make_initial_adapter.py   # worker 환경(CUDA 필요)에서. 기본 출력은 위 폴더
    ```
 
-   이 adapter는 아주 조금 학습된 상태이고, 이 스크립트는 `g1j_1.5b_sft_protocol_validation.json`도 덮어씁니다. 학습이 안 된 깨끗한 초기값(`B=0`)을 만드는 스크립트는 아직 없습니다. 어느 쪽이든 rank 8 / alpha 16, 텐서 192개(파라미터 3,145,728개)여야 coordinator가 받아 줍니다. `--resume` / `--resume-from-hf`로 시작할 때는 체크포인트에서 가중치를 읽으므로 이 폴더에서는 `adapter_config.json`만 있으면 됩니다.
+   - 학습이 안 된 표준 LoRA 초기값입니다. `lora_A`는 Kaiming-uniform, `lora_B`는 0이라 첫 step 전에는 base 모델과 똑같이 동작합니다. 값은 `--seed`(기본 `20261018`)와 텐서 shape만으로 정해지고, base 모델이 어떻게 로드됐는지에는 영향받지 않습니다.
+   - worker와 같은 로더(`load_worker_model`)로 PEFT 모델을 만들어 저장하므로 텐서 이름/shape/dtype이 worker가 요구하는 것과 같습니다. 저장한 파일을 coordinator의 로더로 다시 읽어 rank 8 / alpha 16, 텐서 192개(파라미터 3,145,728개), `lora_B == 0`, fp32, worker의 학습 파라미터와 이름·shape 일치를 확인한 뒤에야 폴더를 만듭니다. 중간에 실패하면 아무것도 남기지 않습니다.
+   - 끝나면 `theta_hash`를 출력합니다. coordinator가 시작할 때 출력하는 `theta_hash`와 같아야 합니다(같은 adapter로 시작했다는 확인). 폴더에는 seed와 라이브러리 버전을 적은 `adapter_init.json`도 남습니다.
+   - `adapter_model.safetensors`가 이미 있으면 `--force` 없이는 거부합니다. coordinator 머신에 GPU가 없으면 worker 머신에서 만들어 폴더째 복사하세요.
+   - 다른 위치에 만들려면 `--output-dir`, base 모델이 다른 경로면 `--base-model`을 쓰고, coordinator에는 같은 경로를 `--initial-adapter-dir`로 넘깁니다.
+   - 이전에 `validate_g1j_sft_protocol.py`가 만든 `artifacts/g1j_1.5b_capybara_sft_protocol`(2 step 학습된 adapter)을 쓰려면 `--initial-adapter-dir`로 그 폴더를 지정하면 됩니다. 이 스크립트는 `g1j_1.5b_sft_protocol_validation.json`도 덮어씁니다.
+   - `--resume` / `--resume-from-hf`로 시작할 때는 체크포인트에서 가중치를 읽으므로 이 폴더에서는 `adapter_config.json`만 쓰입니다.
 
 ### 1. coordinator 실행
 
@@ -160,7 +168,7 @@ python g1j_dist_coordinator.py ... \
 | `--token` | 프로토콜 토큰(기본 `$RWKV_PROTOCOL_TOKEN`) |
 | `--bind`, `--port` | 기본 `127.0.0.1`, `17821`. 다른 주소에 바인딩하면 평문 HTTP 경고가 나옵니다 |
 | `--model-dir`, `--fetch-model-from-hf`, `--hf-cache-dir` | base 모델 위치. coordinator는 `release-manifest.json`만 필요합니다 |
-| `--initial-adapter-dir` | 초기 adapter 폴더(위 "준비물" 참고) |
+| `--initial-adapter-dir` | 초기 adapter 폴더. 기본 `artifacts/g1j_1.5b_lora_init`(위 "준비물" 참고) |
 | `--run-dir` | 산출물 폴더 |
 | `--manual-training-complete` | 마지막 round 후 `POST /training-complete` 대기 |
 | `--keep-checkpoints N` | 보관할 resume 체크포인트 수(기본 3) |
@@ -207,7 +215,7 @@ python g1j_dist_coordinator.py ... \
 python -m unittest discover -p "test_*.py"
 ```
 
-GPU 없이 약 30초에 130여 개가 돕니다. `transformers`/`peft`는 가짜로 대체해서 worker 제어 흐름을 검증하고, coordinator는 실제 HTTP 서버를 띄워 합성 gradient로 여러 round, 재시작, Hub 왕복(가짜 Hub)까지 검증합니다. 실제 모델 계산, 실제 Hugging Face 서버 호출, 여러 GPU 동시 실행은 이 테스트에 포함되지 않습니다.
+GPU 없이 약 40초에 161개가 돕니다. worker 테스트는 `transformers`/`peft`를 가짜로 대체해서 제어 흐름을 검증합니다. `test_make_initial_adapter.py`는 반대로 진짜 PEFT를 쓰고(RWKV와 같은 모듈 구조의 빈 껍데기 모델 위에서), `transformers`/`peft`가 없으면 건너뜁니다(25개). coordinator 테스트는 실제 HTTP 서버를 띄워 합성 gradient로 여러 round, 재시작, Hub 왕복(가짜 Hub)까지 검증합니다. 실제 모델 계산, 실제 Hugging Face 서버 호출, 여러 GPU 동시 실행은 이 테스트에 포함되지 않습니다.
 
 ## 보안과 한계
 

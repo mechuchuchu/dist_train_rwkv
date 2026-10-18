@@ -127,6 +127,28 @@ class CoordinatorCommandLineTests(unittest.TestCase):
         self.assertIn("already holds checkpoints", message)
         self.assertIn("--resume", message)
 
+    def test_a_fresh_start_without_an_initial_adapter_says_how_to_make_one(self):
+        (self.fixtures["adapter"] / "adapter_model.safetensors").unlink()
+        message = self.refused(self.root / "run")
+        self.assertIn("adapter_model.safetensors", message)
+        self.assertIn("python make_initial_adapter.py", message)
+        self.assertIn(str(self.fixtures["adapter"]), message)
+        self.assertFalse((self.root / "run" / "ckpt").exists())
+
+    def test_an_initial_adapter_of_the_wrong_rank_is_a_usage_error(self):
+        (self.fixtures["adapter"] / "adapter_config.json").write_text(
+            json.dumps({"r": 16, "lora_alpha": 16}))
+        self.assertIn("rank 8 / alpha 16", self.refused(self.root / "run"))
+
+    def test_the_default_initial_adapter_dir_is_the_one_the_script_writes(self):
+        argv = ["g1j_dist_coordinator.py", "--help"]
+        output = io.StringIO()
+        with patch.object(sys, "argv", argv), redirect_stdout(output), \
+                self.assertRaises(SystemExit):
+            coordinator_module.main()
+        self.assertIn(str(coordinator_module.DEFAULT_INITIAL_ADAPTER_DIR),
+                      output.getvalue().replace("\n", "").replace(" ", ""))
+
     def test_resume_continues_the_same_run(self):
         run_dir = self.root / "run"
         first, _ = self.run_main(run_dir)
