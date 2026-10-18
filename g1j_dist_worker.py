@@ -36,6 +36,7 @@ from rwkv_dist_protocol import (
     decode_tensors,
     default_model_dir,
     encode_tensors,
+    normalize_nickname,
     sha256_bytes,
     tensor_map_sha256,
     unit_digest,
@@ -152,11 +153,37 @@ def compute_unit(model, params, unit: dict):
     return payload, loss_value, loss_tokens, grad_norm
 
 
+def report_contribution(client, nickname: str, run_id: str) -> None:
+    """Print what this nickname has been credited so far. Never fails the worker."""
+    try:
+        _, _, body = client.request("/contributors", timeout=10.0)
+        listing = json.loads(body)
+        if listing.get("run_id") != run_id:
+            return
+        ranked = listing["contributors"]
+        position = next(index for index, entry in enumerate(ranked) if entry["nickname"] == nickname)
+        entry = ranked[position]
+        rank = 1 + sum(other["loss_tokens"] > entry["loss_tokens"] for other in ranked)
+        print(json.dumps({
+            "status": "contribution", "nickname": nickname, "units": entry["units"],
+            "loss_tokens": entry["loss_tokens"], "steps": entry["steps"],
+            "compute_seconds": entry["compute_seconds"], "rank": rank, "contributors": len(ranked),
+        }, ensure_ascii=False), flush=True)
+    except (CoordinatorUnavailable, CoordinatorHTTPError, OSError, ValueError, KeyError, StopIteration):
+        print(json.dumps({"status": "contribution_unavailable", "nickname": nickname},
+                         ensure_ascii=False), flush=True)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--server", default="http://127.0.0.1:17821")
     parser.add_argument("--token", default=os.environ.get("RWKV_PROTOCOL_TOKEN"))
     parser.add_argument("--worker-id", default=f"worker-{os.getpid()}")
+    parser.add_argument("--contribute", metavar="NICKNAME", default=None,
+                        help="credit the work this worker does to NICKNAME. The coordinator keeps a "
+                             "per-nickname tally (units, loss tokens, compute time) that anyone with "
+                             "the token can read. Nicknames are not authenticated, and workers sharing "
+                             "one are pooled")
     parser.add_argument("--model-id", default=DEFAULT_MODEL_ID,
                         help="base model repository; must be the one the coordinator runs "
                              "(default: %(default)s)")
@@ -176,6 +203,11 @@ def main() -> None:
         parser.error("set --token or RWKV_PROTOCOL_TOKEN")
     if args.model_path is None:
         args.model_path = default_model_dir(args.model_id)
+    if args.contribute is not None:
+        try:
+            args.contribute = normalize_nickname(args.contribute)
+        except ValueError as exc:
+            parser.error(f"--contribute: {exc}")
     if not torch.cuda.is_available():
         raise RuntimeError("worker requires a CUDA GPU")
 
@@ -207,7 +239,15 @@ def main() -> None:
     if descriptor["worker_code_sha256"] != bundle_hash:
         raise RuntimeError("worker bundle hash does not match coordinator's pinned code")
     query = urllib.parse.urlencode({"worker_id": args.worker_id})
-    waiter.get_json(f"/join?{query}")
+    join_fields = {"worker_id": args.worker_id}
+    if args.contribute is not None:
+        join_fields["nickname"] = args.contribute
+    join_query = urllib.parse.urlencode(join_fields)
+    waiter.get_json(f"/join?{join_query}")
+    if args.contribute is not None:
+        print(json.dumps({"status": "contributing", "nickname": args.contribute,
+                          "worker_id": args.worker_id, "run_id": run_id}, ensure_ascii=False),
+              flush=True)
     model_path = ensure_hf_checkpoint(
         args.model_id, args.model_revision, args.model_path,
         fetch_from_hf=args.fetch_model_from_hf,
@@ -229,7 +269,7 @@ def main() -> None:
     processed = 0
     last_waiting_round = None
     while args.max_units == 0 or processed < args.max_units:
-        join_status = waiter.get_json(f"/join?{query}")
+        join_status = waiter.get_json(f"/join?{join_query}")
         if join_status["status"] == "training_complete":
             print(json.dumps({"status": "training_complete", "run_id": run_id,
                               "processed_units": processed}), flush=True)
@@ -401,6 +441,8 @@ def main() -> None:
     final = waiter.get_json("/round")
     if final["run_id"] != run_id:
         raise RuntimeError(f"coordinator run changed after reconnect: {run_id} -> {final['run_id']}")
+    if args.contribute is not None:
+        report_contribution(client, args.contribute, run_id)
     print(json.dumps({
         "status": final["status"],
         "training_complete": final["training_complete"],

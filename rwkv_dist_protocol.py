@@ -8,6 +8,7 @@ import math
 import re
 import threading
 import time
+import unicodedata
 import uuid
 from collections import deque
 from dataclasses import dataclass
@@ -36,6 +37,30 @@ def model_slug(model_id: str) -> str:
     if not slug:
         raise ValueError(f"cannot derive a name from model id {model_id!r}")
     return slug
+
+
+NICKNAME_MAX_CHARS = 32
+ANONYMOUS = "(anonymous)"
+# Words (letters of any script, digits, underscore) joined by single spaces, dots or dashes.
+# No control characters, quotes, slashes or brackets: a nickname ends up in logs, a terminal
+# and file names, and "(anonymous)" can never be chosen on purpose.
+_NICKNAME = re.compile(r"[\w.\-]+(?: [\w.\-]+)*")
+
+
+def normalize_nickname(value: object) -> str:
+    """The canonical form of a contributor nickname; raises ValueError if it is not usable."""
+    if not isinstance(value, str):
+        raise ValueError("nickname must be text")
+    nickname = unicodedata.normalize("NFKC", value).strip()
+    if not nickname:
+        raise ValueError("nickname must not be empty")
+    if len(nickname) > NICKNAME_MAX_CHARS:
+        raise ValueError(f"nickname must be at most {NICKNAME_MAX_CHARS} characters")
+    if _NICKNAME.fullmatch(nickname) is None:
+        raise ValueError(
+            "nickname may only contain letters, digits, '_', '-', '.' and single spaces"
+        )
+    return nickname
 
 
 def canonical_json(value: object) -> bytes:
@@ -256,6 +281,46 @@ class Lease:
     theta_hash: str
 
 
+def _empty_credit() -> dict[str, Any]:
+    return {"units": 0, "loss_tokens": 0, "steps": 0, "compute_seconds": 0.0}
+
+
+def _reported_seconds(value: object) -> float:
+    """A worker's own account of how long a unit took: informational, so just made safe."""
+    try:
+        seconds = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+    return min(seconds, 86400.0) if math.isfinite(seconds) and seconds > 0 else 0.0
+
+
+def rank_contributions(totals: dict[str, dict[str, Any]]) -> list[dict[str, Any]]:
+    """A ledger as a list, most loss tokens first; ties by name, the anonymous bucket last."""
+    ranked = sorted(totals.items(),
+                    key=lambda item: (-item[1]["loss_tokens"], item[0] == ANONYMOUS, item[0]))
+    return [{"nickname": name, **entry, "compute_seconds": round(entry["compute_seconds"], 3)}
+            for name, entry in ranked]
+
+
+def restore_contributions(saved: dict[str, Any] | None) -> dict[str, dict[str, Any]]:
+    """Read a ledger saved by export_contributions(); raises ValueError if it is malformed."""
+    ledger: dict[str, dict[str, Any]] = {}
+    for name, entry in (saved or {}).items():
+        if name != ANONYMOUS:
+            normalize_nickname(name)
+        try:
+            ledger[name] = {
+                "units": int(entry["units"]), "loss_tokens": int(entry["loss_tokens"]),
+                "steps": int(entry["steps"]), "compute_seconds": float(entry["compute_seconds"]),
+            }
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError(f"malformed contribution record for {name!r}") from exc
+        if min(ledger[name]["units"], ledger[name]["loss_tokens"], ledger[name]["steps"]) < 0 \
+                or not math.isfinite(ledger[name]["compute_seconds"]) or ledger[name]["compute_seconds"] < 0:
+            raise ValueError(f"malformed contribution record for {name!r}")
+    return ledger
+
+
 class RoundCoordinator:
     """In-memory optimizer-step coordinator with lease, dedup, stale and gradient checks."""
 
@@ -276,10 +341,12 @@ class RoundCoordinator:
         global_grad_clip: float | None = None,
         theta_version: int = 0,
         optimizer_tensors: dict[str, torch.Tensor] | None = None,
+        contributions: dict[str, Any] | None = None,
     ):
         """`theta_version` and `optimizer_tensors` resume from a saved adapter
         version: the round opened is then round `theta_version + 1`, and the
         AdamW moments continue from `optimizer_tensors` instead of starting cold.
+        `contributions` is the per-nickname ledger saved with that version.
         """
         if not theta:
             raise ValueError("theta must contain trainable tensors")
@@ -337,11 +404,27 @@ class RoundCoordinator:
         self.active_workers: set[str] = set()
         self.queued_workers: set[str] = set()
         self.membership_open = True
+        self.first_lease_at: float | None = None  # when this round first handed out a unit
+        # Contributor nickname per worker, as of its latest join; work is credited to it.
+        self.nicknames: dict[str, str] = {}
+        # nickname -> {units, loss_tokens, steps, compute_seconds} over closed rounds.
+        self.contributions: dict[str, dict[str, Any]] = restore_contributions(contributions)
 
-    def join(self, worker_id: str) -> dict[str, Any]:
+    def join(self, worker_id: str, nickname: str | None = None) -> dict[str, Any]:
+        """Admit a worker. `nickname` names who the worker's accepted units are credited to;
+        a join without one makes the worker anonymous again."""
         if not worker_id or len(worker_id) > 128:
             raise ProtocolError("invalid_worker", "worker_id must be 1..128 chars")
+        if nickname is not None:
+            try:
+                nickname = normalize_nickname(nickname)
+            except ValueError as exc:
+                raise ProtocolError("invalid_nickname", str(exc)) from exc
         with self.lock:
+            if nickname is None:
+                self.nicknames.pop(worker_id, None)
+            else:
+                self.nicknames[worker_id] = nickname
             if self.training_complete:
                 return {"status": "training_complete", "round_id": self.round_id}
             new_membership = False
@@ -356,9 +439,11 @@ class RoundCoordinator:
                 self.active_workers.add(worker_id)
                 status = "active"
             if new_membership:
-                self.events.append({"event": "worker_joined", "worker_id": worker_id,
-                                    "status": status, "round_id": self.round_id,
-                                    "at": time.time()})
+                event = {"event": "worker_joined", "worker_id": worker_id,
+                         "status": status, "round_id": self.round_id, "at": time.time()}
+                if nickname is not None:
+                    event["nickname"] = nickname
+                self.events.append(event)
             return {
                 "status": status,
                 "round_id": self.round_id if status == "active" else self.round_id + 1,
@@ -406,6 +491,7 @@ class RoundCoordinator:
             self.min_units = int(min_units)
             self.closed = False
             self.close_metrics = None
+            self.first_lease_at = None
             self.active_workers.update(self.queued_workers)
             promoted = sorted(self.queued_workers)
             self.queued_workers.clear()
@@ -473,6 +559,27 @@ class RoundCoordinator:
                 self.theta_hash,
             )
 
+    def export_contributions(self) -> dict[str, dict[str, Any]]:
+        """The ledger of closed rounds, for saving with the checkpoint of the same version."""
+        with self.lock:
+            return {name: dict(entry) for name, entry in self.contributions.items()}
+
+    def contributors(self) -> list[dict[str, Any]]:
+        """Everyone credited so far, most loss tokens first.
+
+        Closed rounds come from the ledger; units accepted in the round still open are
+        added on the fly (they are lost with the round if the coordinator restarts).
+        """
+        with self.lock:
+            totals = {name: dict(entry) for name, entry in self.contributions.items()}
+            if not self.closed:
+                for result in self.accepted.values():
+                    entry = totals.setdefault(result.get("nickname") or ANONYMOUS, _empty_credit())
+                    entry["units"] += 1
+                    entry["loss_tokens"] += int(result["loss_tokens"])
+                    entry["compute_seconds"] += float(result.get("compute_seconds", 0.0))
+        return rank_contributions(totals)
+
     def snapshot(self) -> tuple[bytes, str, int]:
         """Return adapter bytes with the theta hash/version they encode.
 
@@ -537,6 +644,8 @@ class RoundCoordinator:
                 )
                 self.leases[lease.lease_id] = lease
                 self.unit_status[unit_id] = "leased"
+                if self.first_lease_at is None:
+                    self.first_lease_at = now
                 self.events.append({
                     "event": "lease_issued", "unit_id": unit_id,
                     "lease_id": lease.lease_id, "worker_id": worker_id,
@@ -652,6 +761,7 @@ class RoundCoordinator:
             loss_sum = float(metadata.get("loss_sum", float("nan")))
             if not math.isfinite(loss_sum) or loss_sum < 0:
                 self._reject_and_requeue(lease, "invalid_loss", "loss_sum must be finite and nonnegative")
+            compute_seconds = _reported_seconds(metadata.get("compute_seconds"))
             try:
                 source = open_gradient_payload(payload)
             except Exception as exc:
@@ -700,8 +810,12 @@ class RoundCoordinator:
                 "loss_sum": loss_sum,
                 "gradient_sha256": metadata["gradient_sha256"],
                 "gradient_norm": math.sqrt(squared_norm),
+                "compute_seconds": compute_seconds,
                 "accepted_at": now,
             }
+            nickname = self.nicknames.get(lease.worker_id)
+            if nickname is not None:
+                result["nickname"] = nickname
             self.accepted[unit_id] = result
             self.loss_tokens += loss_tokens
             self.loss_sum += loss_sum
@@ -720,6 +834,24 @@ class RoundCoordinator:
                 "theta_hash": self.theta_hash,
                 "close_metrics": self.close_metrics,
             }
+
+    def _credit_contributors(self) -> dict[str, dict[str, Any]]:
+        """Add the closing round's accepted units to the ledger; return what this round added."""
+        added: dict[str, dict[str, Any]] = {}
+        for result in self.accepted.values():
+            entry = added.setdefault(result.get("nickname") or ANONYMOUS, _empty_credit())
+            entry["units"] += 1
+            entry["loss_tokens"] += int(result["loss_tokens"])
+            entry["compute_seconds"] += float(result.get("compute_seconds", 0.0))
+        for name, entry in added.items():
+            total = self.contributions.setdefault(name, _empty_credit())
+            total["units"] += entry["units"]
+            total["loss_tokens"] += entry["loss_tokens"]
+            total["compute_seconds"] += entry["compute_seconds"]
+            total["steps"] += 1
+            entry["compute_seconds"] = round(entry["compute_seconds"], 3)
+            del entry["steps"]
+        return added
 
     def _close_round(self) -> None:
         if self.closed:
@@ -746,6 +878,7 @@ class RoundCoordinator:
         self.theta_hash = tensor_map_sha256(self.theta)
         self.closed = True
         self.membership_open = False
+        round_credit = self._credit_contributors()
         self.close_metrics = {
             "unit_count": len(self.accepted),
             "loss_tokens": self.loss_tokens,
@@ -753,6 +886,10 @@ class RoundCoordinator:
             "mean_loss": self.loss_sum / self.loss_tokens,
             "preclip_gradient_norm": norm,
             "global_grad_clip": self.global_grad_clip,
+            # from the first unit handed out (not from when the round opened, which may be hours
+            # before the first worker turns up) to the moment the step closed
+            "round_seconds": round(time.time() - (self.first_lease_at or time.time()), 3),
+            "contributors": round_credit,
             "theta_hash_before": old_hash,
             "theta_hash_after": self.theta_hash,
         }

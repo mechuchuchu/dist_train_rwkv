@@ -8,6 +8,7 @@ its /round, /lease and /snapshot requests.
 
 from __future__ import annotations
 
+import contextlib
 import io
 import json
 import sys
@@ -103,10 +104,12 @@ class ScriptedCoordinator:
         self.routes = {route: list(replies) for route, replies in routes.items()}
         self.sticky = sticky or {}
         self.calls: list[str] = []
+        self.paths: list[str] = []
 
     def request(self, path, *, method="GET", body=None, headers=None, timeout=30.0):
         route = path.split("?", 1)[0]
         self.calls.append(route)
+        self.paths.append(path)
         if route in self.sticky:
             reply = self.sticky[route]
         else:
@@ -374,6 +377,115 @@ class WorkerModelSelectionTests(WorkerHarness, unittest.TestCase):
         self.run_worker(coordinator, model_path=False)
         for call in self.ensure_checkpoint.call_args_list:
             self.assertEqual(call.args[:2], (WORKER.DEFAULT_MODEL_ID, WORKER.DEFAULT_MODEL_REVISION))
+
+
+def contributors_reply(*rows):
+    return {"run_id": "run-1", "theta_version": 1, "contributors": [
+        {"nickname": name, "units": units, "loss_tokens": tokens, "steps": 1, "compute_seconds": 2.5}
+        for name, units, tokens in rows]}
+
+
+class WorkerContributeTests(WorkerHarness, unittest.TestCase):
+    """--contribute NICKNAME: the work is credited to a name the contributor chose."""
+
+    def one_unit(self, extra_routes=None):
+        routes = {
+            "/round": [round_descriptor(T0, 0)] * 4,
+            "/lease": [leased(T0, 0, "lease-1")],
+            "/snapshot": [snapshot_reply(T0)],
+            "/result": [self.accepted_result(T0)],
+        } | (extra_routes or {})
+        return ScriptedCoordinator(routes=routes, sticky={"/join": {"status": "active"}})
+
+    def joins(self, coordinator):
+        return [path for path in coordinator.paths if path.startswith("/join")]
+
+    def test_the_nickname_is_sent_with_every_join(self):
+        coordinator = self.one_unit({"/contributors": [contributors_reply(("Alice", 1, 1))]})
+
+        self.run_worker(coordinator, flags=("--contribute", "Alice"))
+
+        joins = self.joins(coordinator)
+        self.assertGreaterEqual(len(joins), 2)
+        self.assertEqual(set(joins), {"/join?worker_id=w&nickname=Alice"})
+
+    def test_a_nickname_in_any_script_is_sent_percent_encoded(self):
+        coordinator = self.one_unit({"/contributors": [contributors_reply(("김철수", 1, 1))]})
+
+        output, _ = self.run_worker(coordinator, flags=("--contribute", "김철수"))
+
+        self.assertEqual(set(self.joins(coordinator)),
+                         {"/join?worker_id=w&nickname=%EA%B9%80%EC%B2%A0%EC%88%98"})
+        self.assertIn('"nickname": "김철수"', output)
+
+    def test_the_nickname_is_tidied_the_way_the_coordinator_will(self):
+        coordinator = self.one_unit({"/contributors": [contributors_reply(("alice", 1, 1))]})
+        self.run_worker(coordinator, flags=("--contribute", "  ａｌｉｃｅ "))
+        self.assertEqual(set(self.joins(coordinator)), {"/join?worker_id=w&nickname=alice"})
+
+    def test_the_worker_says_it_is_contributing_once_the_coordinator_has_taken_it(self):
+        coordinator = self.one_unit({"/contributors": [contributors_reply(("Alice", 1, 1))]})
+
+        output, _ = self.run_worker(coordinator, flags=("--contribute", "Alice"))
+
+        line = next(line for line in output.splitlines() if '"contributing"' in line)
+        self.assertEqual(json.loads(line), {"status": "contributing", "nickname": "Alice",
+                                            "worker_id": "w", "run_id": "run-1"})
+        self.assertLess(output.index("contributing"), output.index("loading "))
+
+    def test_without_the_option_nothing_about_contributors_is_sent_or_printed(self):
+        coordinator = self.one_unit()
+
+        output, _ = self.run_worker(coordinator)
+
+        self.assertEqual(set(self.joins(coordinator)), {"/join?worker_id=w"})
+        self.assertNotIn("/contributors", coordinator.calls)
+        self.assertNotIn("contribut", output)
+
+    def test_an_unusable_nickname_stops_the_worker_before_it_talks_to_anyone(self):
+        for nickname in ("bad\nname", "", "x" * 33, "(anonymous)"):
+            with self.subTest(nickname=nickname):
+                coordinator = self.one_unit()
+                with contextlib.redirect_stderr(io.StringIO()) as errors, \
+                        self.assertRaises(SystemExit) as caught:
+                    self.run_worker(coordinator, flags=("--contribute", nickname))
+                self.assertEqual(caught.exception.code, 2)
+                self.assertIn("--contribute", errors.getvalue())
+                self.assertEqual(coordinator.calls, [])
+
+    def test_at_the_end_the_contributor_is_told_what_was_credited_and_where_they_stand(self):
+        coordinator = self.one_unit({"/contributors": [contributors_reply(
+            ("bob", 9, 90), ("Alice", 4, 40), ("(anonymous)", 1, 10))]})
+
+        output, _ = self.run_worker(coordinator, flags=("--contribute", "Alice"))
+
+        line = next(line for line in output.splitlines() if '"status": "contribution"' in line)
+        self.assertEqual(json.loads(line), {
+            "status": "contribution", "nickname": "Alice", "units": 4, "loss_tokens": 40, "steps": 1,
+            "compute_seconds": 2.5, "rank": 2, "contributors": 3})
+
+    def test_equal_work_shares_a_rank(self):
+        coordinator = self.one_unit({"/contributors": [contributors_reply(("amy", 2, 20), ("Alice", 2, 20))]})
+        output, _ = self.run_worker(coordinator, flags=("--contribute", "Alice"))
+        line = next(line for line in output.splitlines() if '"status": "contribution"' in line)
+        self.assertEqual(json.loads(line)["rank"], 1)
+
+    def test_a_listing_that_cannot_be_had_does_not_fail_the_worker(self):
+        failures = {
+            "server error": CoordinatorHTTPError(500, {"error": "boom"}),
+            "not json": (200, {}, b"<html>"),
+            "someone elses run": contributors_reply(("Alice", 1, 1)) | {"run_id": "another-run"},
+            "nickname missing": contributors_reply(("bob", 1, 1)),
+            "wrong shape": {"run_id": "run-1"},
+        }
+        for label, reply in failures.items():
+            with self.subTest(case=label):
+                coordinator = self.one_unit({"/contributors": [reply]})
+                output, _ = self.run_worker(coordinator, flags=("--contribute", "Alice"))
+                self.assertEqual(coordinator.calls.count("/result"), 1)
+                self.assertNotIn('"status": "contribution"', output)
+                if label != "someone elses run":
+                    self.assertIn('"contribution_unavailable"', output)
 
 
 if __name__ == "__main__":

@@ -2,13 +2,16 @@ from __future__ import annotations
 
 import io
 import json
+import re
 import base64
 import tempfile
 import threading
 import unittest
+from contextlib import redirect_stdout
 from pathlib import Path
 from http.server import ThreadingHTTPServer
 from urllib.error import HTTPError
+from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 from unittest.mock import patch
 
@@ -453,15 +456,17 @@ class Served:
         except HTTPError as error:
             return error.code, json.loads(error.read())
 
-    def work(self, worker_id: str, *, max_units: int | None = None) -> list[tuple[int, dict]]:
+    def work(self, worker_id: str, *, max_units: int | None = None,
+             nickname: str | None = None, **metadata) -> list[tuple[int, dict]]:
         """Lease and submit units until the round closes or `max_units` were sent."""
-        self.get_json(f"/join?worker_id={worker_id}")
+        fields = {"worker_id": worker_id} | ({"nickname": nickname} if nickname is not None else {})
+        self.get_json(f"/join?{urlencode(fields)}")
         results = []
         while max_units is None or len(results) < max_units:
             lease = self.get_json(f"/lease?worker_id={worker_id}")
             if lease["status"] != "leased":
                 break
-            status, body = self.post_result(worker_id, lease)
+            status, body = self.post_result(worker_id, lease, **metadata)
             results.append((status, body))
             if body.get("round_closed"):
                 break
@@ -1266,3 +1271,180 @@ class LeanCoordinatorTests(unittest.TestCase):
         probes = [e["n"] for e in map(json.loads, (app.run_dir / "round_log.jsonl").read_text().splitlines())
                   if e["event"] == "probe"]
         self.assertEqual(probes, [1, 2])
+
+
+
+class ContributorTests(unittest.TestCase):
+    """--contribute on the coordinator side: who did how much, over HTTP, in files and in the console."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+
+    def run_three_steps(self, served):
+        """alice 2 | alice 1 + anonymous 1 | bob 2 (units are 1 loss token each)."""
+        served.work("gpu-a", nickname="Alice")
+        served.get_json("/join?worker_id=gpu-x")  # everyone of a step joins before its first lease
+        served.work("gpu-a", nickname="Alice", max_units=1)
+        served.work("gpu-x")
+        served.work("gpu-b", nickname="bob")
+
+    def test_work_is_credited_per_nickname_and_listed_over_http(self):
+        app = open_run(self.root)
+        with Served(app) as served:
+            self.run_three_steps(served)
+            listing = served.get_json("/contributors")
+
+        self.assertEqual(listing["run_id"], "run-resume")
+        self.assertEqual(listing["theta_version"], 3)
+        rows = {row["nickname"]: row for row in listing["contributors"]}
+        self.assertEqual([row["nickname"] for row in listing["contributors"]], ["Alice", "bob", "(anonymous)"])
+        self.assertEqual((rows["Alice"]["units"], rows["Alice"]["loss_tokens"], rows["Alice"]["steps"]), (3, 3, 2))
+        self.assertEqual((rows["bob"]["units"], rows["bob"]["steps"]), (2, 1))
+        self.assertEqual((rows["(anonymous)"]["units"], rows["(anonymous)"]["steps"]), (1, 1))
+
+    def test_the_listing_includes_a_step_still_under_way_but_the_ledger_does_not(self):
+        app = open_run(self.root)
+        with Served(app) as served:
+            served.work("gpu-a", nickname="Alice", max_units=1)
+            live = served.get_json("/contributors")["contributors"]
+        self.assertEqual([(c["nickname"], c["units"], c["steps"]) for c in live], [("Alice", 1, 0)])
+        self.assertEqual(app.coordinator.export_contributions(), {})
+
+    def test_the_listing_needs_the_token(self):
+        app = open_run(self.root)
+        with Served(app) as served:
+            with self.assertRaises(HTTPError) as caught:
+                urlopen(Request(served.base_url + "/contributors"), timeout=5)
+        self.assertEqual(caught.exception.code, 401)
+
+    def test_an_unusable_nickname_is_refused_at_join(self):
+        app = open_run(self.root)
+        with Served(app) as served:
+            for nickname in ("bad\nname", "", "x" * 33, "<b>"):
+                with self.subTest(nickname=nickname):
+                    with self.assertRaises(HTTPError) as caught:
+                        served.get_json("/join?" + urlencode({"worker_id": "gpu-a", "nickname": nickname}))
+                    self.assertEqual(caught.exception.code, 400)
+                    self.assertEqual(json.loads(caught.exception.read())["error"], "invalid_nickname")
+            self.assertEqual(served.get_json("/round")["active_workers"], 0)
+
+    def test_a_nickname_in_any_script_survives_the_round_trip(self):
+        app = open_run(self.root)
+        with Served(app) as served:
+            served.work("gpu-a", nickname="김철수")
+            names = [row["nickname"] for row in served.get_json("/contributors")["contributors"]]
+        self.assertEqual(names, ["김철수"])
+        self.assertEqual(logged_events(app, "worker_joined")[0]["nickname"], "김철수")
+        self.assertIn("김철수", (app.run_dir / "contributors.json").read_text())  # not \\u-escaped
+
+    def test_contributors_json_follows_the_closed_steps(self):
+        app = open_run(self.root)
+        document = json.loads((app.run_dir / "contributors.json").read_text())
+        self.assertEqual((document["as_of_theta_version"], document["contributors"]), (0, []))
+        with Served(app) as served:
+            served.work("gpu-a", nickname="Alice")
+            served.work("gpu-a", nickname="Alice", max_units=1)  # half of step 2: not credited yet
+        document = json.loads((app.run_dir / "contributors.json").read_text())
+        self.assertEqual(document["as_of_theta_version"], 1)
+        self.assertEqual([(c["nickname"], c["units"]) for c in document["contributors"]], [("Alice", 2)])
+        self.assertIn("unauthenticated", document["note"])
+
+    def test_the_ledger_is_saved_with_each_checkpoint(self):
+        app = open_run(self.root)
+        with Served(app) as served:
+            served.work("gpu-a", nickname="Alice")
+        versions = {version: load_checkpoint(app.run_dir / "ckpt" / checkpoint_name(version)).state
+                    for version in list_checkpoint_versions(app.run_dir / "ckpt")}
+        self.assertEqual(versions[0]["contributions"], {})
+        self.assertEqual(versions[1]["contributions"]["Alice"]["units"], 2)
+
+    def test_a_restart_keeps_the_credit_of_closed_steps_and_drops_the_interrupted_one(self):
+        app = open_run(self.root)
+        with Served(app) as served:
+            served.work("gpu-a", nickname="Alice")                    # step 1 closes
+            served.work("gpu-a", nickname="Alice", max_units=1)       # step 2 half done, then "crash"
+        loaded = load_latest_checkpoint(app.run_dir / "ckpt")
+
+        resumed = open_run(self.root, loaded=loaded)
+
+        with Served(resumed) as served:
+            before = served.get_json("/contributors")["contributors"]
+            self.assertEqual([(c["nickname"], c["units"], c["steps"]) for c in before], [("Alice", 2, 1)])
+            served.finish("gpu-a")
+            after = served.get_json("/contributors")["contributors"]
+        self.assertEqual([(c["nickname"], c["units"]) for c in after],
+                         [("(anonymous)", 4), ("Alice", 2)])
+
+    def test_a_damaged_ledger_in_a_checkpoint_stops_the_resume(self):
+        app = open_run(self.root)
+        loaded = load_latest_checkpoint(app.run_dir / "ckpt")
+        loaded.state["contributions"] = {"Alice": {"units": "many"}}
+        with self.assertRaisesRegex(ResumeError, "contribution ledger"):
+            open_run(self.root, loaded=loaded)
+
+    def test_a_checkpoint_from_before_the_feature_resumes_with_an_empty_ledger(self):
+        app = open_run(self.root)
+        loaded = load_latest_checkpoint(app.run_dir / "ckpt")
+        loaded.state.pop("contributions")
+        resumed = open_run(self.root, loaded=loaded)
+        self.assertEqual(resumed.coordinator.contributors(), [])
+
+    def console(self, action) -> str:
+        output = io.StringIO()
+        with redirect_stdout(output):
+            action()
+        return output.getvalue()
+
+    def test_a_closing_step_prints_one_summary_line(self):
+        app = open_run(self.root)
+        with Served(app) as served:
+            printed = self.console(lambda: served.work("gpu-a", nickname="Alice", compute_seconds=1.0))
+        lines = [line for line in printed.splitlines() if " step " in line]
+        self.assertEqual(len(lines), 1, printed)
+        self.assertRegex(lines[0], r"^\[\d{4}-\d\d-\d\d \d\d:\d\d:\d\d\] step 1/3 closed \| mean_loss 1\.0000 \| "
+                                   r"2 units, 2 loss tokens \| grad_norm [0-9.e+-]+ \| [0-9.]+s \| contributors: Alice 2$")
+
+    def test_the_summary_lists_everyone_who_took_part_most_units_first(self):
+        app = open_run(self.root)
+        with Served(app) as served:
+            served.work("gpu-a", nickname="Alice")
+            served.get_json("/join?worker_id=gpu-x")
+            printed = self.console(lambda: (served.work("gpu-b", nickname="bob", max_units=1),
+                                            served.work("gpu-x")))
+        summary = next(line for line in printed.splitlines() if " step 2/3 closed" in line)
+        self.assertTrue(summary.endswith("contributors: bob 1, (anonymous) 1"), summary)
+
+    def test_a_step_done_only_by_anonymous_workers_names_nobody(self):
+        app = open_run(self.root)
+        with Served(app) as served:
+            printed = self.console(lambda: served.work("gpu-x"))
+        summary = next(line for line in printed.splitlines() if " step 1/3 closed" in line)
+        self.assertNotIn("contributors", summary)
+
+    def test_a_contributor_joining_is_announced_once(self):
+        app = open_run(self.root)
+        with Served(app) as served:
+            printed = self.console(lambda: (served.work("gpu-a", nickname="Alice", max_units=1),
+                                            served.work("gpu-a", nickname="Alice", max_units=1)))
+        joined = [line for line in printed.splitlines() if "joined with worker" in line]
+        self.assertEqual(len(joined), 1, printed)
+        self.assertTrue(joined[0].endswith('contributor "Alice" joined with worker gpu-a'), joined[0])
+
+    def test_a_worker_joining_a_running_step_is_told_it_starts_with_the_next_one(self):
+        app = open_run(self.root)
+        with Served(app) as served:
+            served.work("gpu-a", nickname="Alice", max_units=1)  # the step is under way
+            printed = self.console(lambda: served.get_json("/join?" + urlencode(
+                {"worker_id": "gpu-b", "nickname": "bob"})))
+        self.assertIn('contributor "bob" joined with worker gpu-b (starts with the next round)', printed)
+
+    def test_a_report_that_cannot_be_built_never_loses_the_log(self):
+        app = open_run(self.root)
+        app.coordinator.events.append({"event": "round_closed", "theta_version": 1})  # no metrics
+        app.coordinator.events.append({"event": "probe"})
+        printed = self.console(app.persist_events)
+        self.assertEqual(printed, "")
+        self.assertEqual([e["event"] for e in logged_events(app, "round_closed")], ["round_closed"])
+        self.assertEqual(len(logged_events(app, "probe")), 1)

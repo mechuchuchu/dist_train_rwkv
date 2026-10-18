@@ -32,6 +32,7 @@ from rwkv_dist_checkpoint import (
     write_checkpoint,
 )
 from rwkv_dist_protocol import (
+    ANONYMOUS,
     PayloadFile,
     ProtocolError,
     RoundCoordinator,
@@ -41,6 +42,8 @@ from rwkv_dist_protocol import (
     model_slug,
     parameter_name_to_peft_saved_name,
     peft_saved_name_to_parameter_name,
+    rank_contributions,
+    restore_contributions,
     sha256_bytes,
     tensor_map_sha256,
     unit_digest,
@@ -256,6 +259,7 @@ def build_coordinator(
         if initial_theta is None:
             raise ValueError("a fresh run needs an initial theta")
         start, theta, run_id, optimizer_tensors = 0, initial_theta, new_run_id, None
+        contributions = None
     else:
         check_resume_compatibility(loaded.state, {
             "data_manifest_sha256": manifest["manifest_sha256"],
@@ -274,6 +278,10 @@ def build_coordinator(
         theta = loaded.theta
         run_id = loaded.state["run_id"]
         optimizer_tensors = loaded.optimizer_tensors
+        try:
+            contributions = restore_contributions(loaded.state.get("contributions"))
+        except ValueError as exc:
+            raise ResumeError(f"checkpoint has a malformed contribution ledger: {exc}") from exc
     step = round_plan[start]
     coordinator = RoundCoordinator(
         theta=theta,
@@ -290,6 +298,7 @@ def build_coordinator(
         global_grad_clip=None,
         theta_version=start,
         optimizer_tensors=optimizer_tensors,
+        contributions=contributions,
     )
     if loaded is not None:
         if coordinator.theta_hash != loaded.state["theta_hash"]:
@@ -439,6 +448,37 @@ class Application:
                     for event in events:
                         f.write(json.dumps(event, sort_keys=True, ensure_ascii=False) + "\n")
                 del self.coordinator.events[:len(events)]
+                for event in events:
+                    line = self.console_line(event)
+                    if line:
+                        print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {line}", flush=True)
+
+    def console_line(self, event: dict) -> str | None:
+        """The one-line console report for the events worth reading while a run is going."""
+        try:
+            kind = event.get("event")
+            if kind == "round_closed":
+                metrics = event["metrics"]
+                parts = [
+                    f"step {event['theta_version']}/{len(self.round_plan)} closed",
+                    f"mean_loss {metrics['mean_loss']:.4f}",
+                    f"{metrics['unit_count']} units, {metrics['loss_tokens']} loss tokens",
+                    f"grad_norm {metrics['preclip_gradient_norm']:.4g}",
+                    f"{metrics['round_seconds']:.1f}s",
+                ]
+                credit = metrics.get("contributors", {})
+                if any(name != ANONYMOUS for name in credit):
+                    ranked = sorted(credit.items(),
+                                    key=lambda item: (-item[1]["units"], item[0] == ANONYMOUS, item[0]))
+                    parts.append("contributors: " + ", ".join(
+                        f"{name} {entry['units']}" for name, entry in ranked))
+                return " | ".join(parts)
+            if kind == "worker_joined" and event.get("nickname"):
+                waiting = "" if event.get("status") == "active" else " (starts with the next round)"
+                return f"contributor \"{event['nickname']}\" joined with worker {event['worker_id']}{waiting}"
+        except (KeyError, TypeError, ValueError):
+            return None  # a report must never get in the way of saving the log
+        return None
 
     def stream_upload(self, source, size: int) -> PayloadFile:
         """Copy `size` bytes from `source` to a file in incoming/, hashing as they pass.
@@ -523,7 +563,9 @@ class Application:
 
     def save_resume_checkpoint(self) -> None:
         """Commit the current adapter version for --resume (a no-op if already saved)."""
-        theta, optimizer_tensors, version, theta_hash = self.coordinator.export_state()
+        with self.coordinator.lock:  # the ledger and the adapter version must be of the same round
+            theta, optimizer_tensors, version, theta_hash = self.coordinator.export_state()
+            contributions = self.coordinator.export_contributions()
         write_checkpoint(
             self.run_dir / "ckpt",
             state={
@@ -536,6 +578,7 @@ class Application:
                 "base": self.coordinator.base,
                 "tokenizer": self.coordinator.tokenizer,
                 "hyperparameters": self.coordinator.hyperparameters(),
+                "contributions": contributions,
             },
             theta=theta,
             optimizer_tensors=optimizer_tensors,
@@ -575,8 +618,21 @@ class Application:
             }
             summary["hub_push"] = self._hub_state_locked()
             (self.run_dir / "coordinator_state.json").write_text(json.dumps(summary, indent=2, ensure_ascii=False) + "\n")
+            self.write_contributors_file()
             self.persist_events()
             self.prune_gradients()
+
+    def write_contributors_file(self) -> None:
+        """contributors.json: who has been credited for the closed rounds (the saved ledger)."""
+        document = {
+            "run_id": self.coordinator.run_id,
+            "as_of_theta_version": self.coordinator.theta_version,
+            "note": "credit for closed optimizer steps; nicknames are self-chosen and unauthenticated",
+            "contributors": rank_contributions(self.coordinator.export_contributions()),
+        }
+        temp = self.run_dir / "contributors.tmp"
+        temp.write_text(json.dumps(document, indent=2, ensure_ascii=False) + "\n")
+        temp.replace(self.run_dir / "contributors.json")
 
     def _hub_state_locked(self) -> dict:
         return {
@@ -923,10 +979,19 @@ def make_handler(app: Application):
                 self.end_headers()
                 self.wfile.write(body)
                 return
+            if route.path == "/contributors":
+                self._json(200, {
+                    "run_id": app.coordinator.run_id,
+                    "theta_version": app.coordinator.theta_version,
+                    "contributors": app.coordinator.contributors(),
+                })
+                return
             if route.path == "/join":
-                worker_id = parse_qs(route.query).get("worker_id", [""])[0]
+                # keep_blank_values: "?nickname=" is an empty nickname (refused), not a missing one
+                query = parse_qs(route.query, keep_blank_values=True)
+                worker_id = query.get("worker_id", [""])[0]
                 try:
-                    result = app.coordinator.join(worker_id)
+                    result = app.coordinator.join(worker_id, query.get("nickname", [None])[0])
                     app.persist_events()
                     self._json(200, result)
                 except ProtocolError as exc:
@@ -1223,6 +1288,8 @@ def main() -> None:
             parser.error(f"cannot resume from the Hub: {exc}")
         for problem in loaded.skipped:
             print(f"WARNING: skipped an unusable Hub checkpoint: {problem}", flush=True)
+        print("NOTE: contributor credit is not stored on the Hub; the ledger of this restored run "
+              "starts empty (a later local --resume keeps it).", flush=True)
         if not loaded.optimizer_tensors:
             print("WARNING: this Hub checkpoint carries no optimizer state; the adapter is restored "
                   "but the Adam moments start cold, so later steps will differ from an "

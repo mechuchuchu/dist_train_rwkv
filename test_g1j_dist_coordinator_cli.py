@@ -313,6 +313,12 @@ class CoordinatorCommandLineTests(unittest.TestCase):
         self.assertIn("cannot resume", message)
         self.assertIn("base (checkpoint", message)
 
+    def test_a_local_resume_does_not_say_the_credit_was_lost(self):
+        run_dir = self.root / "run"
+        self.run_main(run_dir)
+        _, printed = self.run_main(run_dir, "--resume")
+        self.assertNotIn("contributor credit", printed)
+
     def test_resume_continues_the_same_run(self):
         run_dir = self.root / "run"
         first, _ = self.run_main(run_dir)
@@ -361,6 +367,7 @@ class CoordinatorCommandLineTests(unittest.TestCase):
         self.assertEqual(status["run_id"], origin["run_id"])
         self.assertFalse(status["optimizer_restored"])
         self.assertIn("Adam moments start cold", printed)
+        self.assertIn("contributor credit is not stored on the Hub", printed)
         # The restored run now has its own local checkpoints, so a later --resume works offline.
         self.assertEqual(list_checkpoint_versions(self.root / "restored" / "ckpt"), [0])
 

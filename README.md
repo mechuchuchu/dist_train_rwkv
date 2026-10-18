@@ -119,8 +119,34 @@ curl -s -H "Authorization: Bearer $RWKV_PROTOCOL_TOKEN" http://127.0.0.1:17821/r
 tail -f runs/my-first-run/round_log.jsonl
 ```
 
+- **coordinator 콘솔.** 시작할 때 설정 요약 JSON 한 덩어리가 나오고, 그 뒤로는 HTTP 요청 로그와 step이 닫힐 때마다 한 줄이 나옵니다.
+
+  ```
+  [2026-10-18 23:39:37] contributor "Alice" joined with worker gpu-a
+  [2026-10-18 23:39:37] step 1/3 closed | mean_loss 1.7000 | 2 units, 2 loss tokens | grad_norm 0.6394 | 0.6s | contributors: Alice 2
+  ```
+
+  `step N/M`은 닫힌 optimizer step 수 / 계획된 step 수, 시간은 그 step의 첫 unit이 나간 때부터 닫힐 때까지입니다. `contributors:`는 닉네임을 쓴 worker가 한 명이라도 있을 때만 붙습니다([기여자 닉네임](#기여자-닉네임---contribute)). 같은 내용이 `round_log.jsonl`의 `round_closed` 이벤트(`metrics`)에도 남습니다.
+- **worker 콘솔.** `loading ... on <GPU>` 한 줄 뒤에 unit을 끝낼 때마다 JSON 한 줄(`unit_id`, `mean_loss`, `gradient_norm`, `compute_seconds`, `accepted`, `round_closed`, `theta_hash`)이 나오고, 끝나면 `training_complete`와 마지막 step의 `close_metrics`가 나옵니다. `round_closed: true`인 줄이 그 worker가 step을 닫았다는 뜻입니다. coordinator에 닿지 않으면 `coordinator_unavailable`을 찍으며 기다립니다.
 - 계획된 step이 모두 닫히면 coordinator가 자동으로 "학습 완료"를 표시하고 worker들이 종료합니다. coordinator 프로세스는 계속 떠 있으니 `Ctrl+C`로 끄세요. `--manual-training-complete`를 쓰면 마지막 round 이후에 `POST /training-complete`를 직접 보내야 완료됩니다.
 - 결과 adapter 확인: `python validate_g1j_dist_checkpoint.py --run-dir runs/my-first-run`
+
+## 기여자 닉네임 (`--contribute`)
+
+내 PC의 GPU를 다른 사람이 연 학습에 보태는 worker는 이름표를 달 수 있습니다.
+
+```bash
+python g1j_dist_worker.py --server http://서버주소:17821 --contribute "Alice"
+```
+
+- 닉네임은 최대 32자이고 어떤 언어의 글자, 숫자, `_ - .`, 낱말 사이 한 칸 공백만 됩니다(`김철수`도 가능). 앞뒤 공백을 지우고 전각 문자 같은 모양만 다른 글자는 합칩니다. 줄바꿈, 따옴표, 괄호 등은 로그와 터미널을 어지럽힐 수 있어 거부합니다. 안 되는 이름이면 worker가 아무 요청도 보내기 전에 멈춥니다.
+- coordinator는 **step이 닫힐 때** 그 step에서 인정된 unit을 닉네임별로 기록합니다: unit 수, 학습한 loss token 수, 참여한 step 수, 연산 시간. 기록은 체크포인트와 같은 버전으로 저장돼서 `--resume`해도 이어지고, 중단된 step의 작업은 학습처럼 기록에서도 빠집니다. 닉네임 없는 worker의 작업은 `(anonymous)`로 모읍니다.
+- 같은 닉네임을 쓰는 worker는 한 사람으로 합산합니다(노트북과 데스크톱을 같은 이름으로 붙여도 됩니다). 한 worker가 재시작하면서 닉네임을 바꾸면 바꾸기 전 unit은 이전 이름으로 남습니다.
+- 보는 방법:
+  - worker가 끝날 때 자기 몫을 출력합니다: `{"status": "contribution", "nickname": "Alice", "units": 4, "loss_tokens": 40, "steps": 2, "compute_seconds": 1.2, "rank": 1, "contributors": 3}` (`rank`는 loss token 기준).
+  - `GET /contributors`(토큰 필요)는 진행 중인 step까지 포함한 전체 목록을 loss token 많은 순으로 줍니다.
+  - `<run-dir>/contributors.json`은 닫힌 step까지의 기록입니다.
+- **한계.** 닉네임은 인증되지 않습니다. 토큰을 가진 사람은 누구든 아무 닉네임이나 쓸 수 있고, 남의 닉네임도 쓸 수 있습니다(토큰 하나를 공유하는 현재 구조의 한계입니다). `compute_seconds`는 worker가 스스로 보고한 값이라 참고용이고, loss token은 coordinator가 검증한 값입니다. 목록은 토큰을 가진 모든 참여자가 볼 수 있습니다. 기록은 Hugging Face로 올라가지 않아서 `--resume-from-hf`로 복원한 run은 빈 기록으로 시작합니다(시작할 때 알림이 나옵니다).
 
 ## 다른 모델 크기 쓰기
 
@@ -242,6 +268,7 @@ python g1j_dist_coordinator.py ... \
 | `--server` | coordinator 주소(기본 `http://127.0.0.1:17821`) |
 | `--token` | 기본 `$RWKV_PROTOCOL_TOKEN` |
 | `--worker-id` | 식별자(기본 `worker-<pid>`). 동시에 여러 worker를 쓸 때는 서로 다르게 |
+| `--contribute NICKNAME` | 이 worker가 한 작업을 NICKNAME으로 기록([기여자 닉네임](#기여자-닉네임---contribute)) |
 | `--model-id`, `--model-revision` | 이 worker가 맡을 모델(기본 G1j 1.5B). coordinator와 다르면 `join` 전에 에러로 멈춥니다 |
 | `--model-path`, `--fetch-model-from-hf`, `--hf-cache-dir` | base 모델 위치(기본 `/workspace/<모델 이름>`). worker는 HF 쓰기 토큰 옵션이 없고 다운로드도 비인증입니다 |
 | `--max-units` | 처리할 unit 수 상한. 0은 학습이 끝날 때까지 |
@@ -258,6 +285,7 @@ python g1j_dist_coordinator.py ... \
 | `theta.safetensors` | coordinator 내부 이름의 같은 텐서 |
 | `ckpt/theta-NNNNNN/` | resume용 체크포인트 |
 | `coordinator_state.json` | 현재 round, 해시, 인정된 결과 요약, Hub push 상태 |
+| `contributors.json` | 닫힌 step까지 닉네임별 기여(unit, loss token, step 수, 연산 시간) |
 | `round_log.jsonl` | 이벤트 로그(join, lease, 결과 인정/거부, round 종료, resume 등) |
 | `gradients/round-NNNNNN/` | 인정된 unit별 gradient (감사용. resume과 Hub push는 읽지 않습니다). `--keep-gradient-rounds`만큼만 남습니다 |
 | `incoming/` | 업로드 중인 `/result` 본문의 임시 파일. 처리가 끝나면 비워지고, 시작할 때도 비웁니다 |
@@ -268,7 +296,7 @@ python g1j_dist_coordinator.py ... \
 
 ## HTTP 엔드포인트
 
-모두 `Authorization: Bearer <token>`이 필요합니다. 운영에서 직접 쓸 것은 `GET /round`(현재 round 상태)와 `POST /hub-push`(실패한 push 재시도, Hub 사용 시) 정도이고, 나머지(`/health`, `/join`, `/lease`, `/snapshot`, `/heartbeat`, `/release`, `/result`, `/training-complete`)는 worker 프로토콜입니다.
+모두 `Authorization: Bearer <token>`이 필요합니다. 운영에서 직접 쓸 것은 `GET /round`(현재 round 상태)와 `POST /hub-push`(실패한 push 재시도, Hub 사용 시) 정도이고, 나머지(`/health`, `/join`, `/lease`, `/snapshot`, `/heartbeat`, `/release`, `/result`, `/training-complete`)는 worker 프로토콜입니다. `GET /contributors`는 닉네임별 기여 목록입니다.
 
 ## 테스트
 
@@ -276,7 +304,7 @@ python g1j_dist_coordinator.py ... \
 python -m unittest discover -p "test_*.py"
 ```
 
-GPU 없이 약 45초에 240개가 돕니다. worker 테스트는 `transformers`/`peft`를 가짜로 대체해서 제어 흐름을 검증합니다. `test_make_initial_adapter.py`는 반대로 진짜 PEFT를 쓰고(RWKV와 같은 모듈 구조의 빈 껍데기 모델 위에서, 24×2048 / 32×2560 / 32×4096), `transformers`/`peft`가 없으면(`requirements-worker.txt`를 설치하지 않으면) 건너뜁니다(34개, 나머지 206개는 그대로 통과). `test_model_schema.py`는 크기별 스키마와 모델 이름에서 파생되는 경로/실행 이름을, `test_prepare_units.py`는 `datasets`/tokenizer를 가짜로 대체해 데이터 shard가 모델 신원을 기록하고 coordinator가 그 모델에서만 받아들이는지를 검증합니다. coordinator 테스트는 실제 HTTP 서버를 띄워 합성 gradient로 여러 round, 재시작, Hub 왕복(가짜 Hub)까지 검증합니다. 실제 모델 계산, 실제 Hugging Face 서버 호출, 여러 GPU 동시 실행은 이 테스트에 포함되지 않습니다.
+GPU 없이 약 55초에 292개가 돕니다. worker 테스트는 `transformers`/`peft`를 가짜로 대체해서 제어 흐름을 검증합니다. `test_make_initial_adapter.py`는 반대로 진짜 PEFT를 쓰고(RWKV와 같은 모듈 구조의 빈 껍데기 모델 위에서, 24×2048 / 32×2560 / 32×4096), `transformers`/`peft`가 없으면(`requirements-worker.txt`를 설치하지 않으면) 건너뜁니다(34개, 나머지 258개는 그대로 통과). `test_model_schema.py`는 크기별 스키마와 모델 이름에서 파생되는 경로/실행 이름을, `test_prepare_units.py`는 `datasets`/tokenizer를 가짜로 대체해 데이터 shard가 모델 신원을 기록하고 coordinator가 그 모델에서만 받아들이는지를 검증합니다. coordinator 테스트는 실제 HTTP 서버를 띄워 합성 gradient로 여러 round, 재시작, Hub 왕복(가짜 Hub)까지 검증합니다. 실제 모델 계산, 실제 Hugging Face 서버 호출, 여러 GPU 동시 실행은 이 테스트에 포함되지 않습니다.
 
 ## 보안과 한계
 
@@ -300,6 +328,7 @@ GPU 없이 약 45초에 240개가 돕니다. worker 테스트는 `transformers`/
 | `coordinator trains X@sha, but this worker was started for Y@sha` | worker와 coordinator의 `--model-id`/`--model-revision`이 다릅니다. worker를 coordinator와 같은 값으로 다시 시작하세요 |
 | `initial adapter was made for a model with N layers of width W, but ...` | 초기 adapter가 다른 크기 모델용입니다. `make_initial_adapter.py --model-id ... --model-revision ...`로 이 모델용을 만드세요 |
 | `tokenized shard was made for X, not Y` | `--units`로 준 데이터가 다른 모델(또는 commit)의 tokenizer로 만들어졌습니다. `prepare_g1j_protocol_units.py`를 같은 `--model-id/--model-revision`으로 다시 실행하세요 |
+| `--contribute: nickname ...` (worker) / HTTP 400 `invalid_nickname` | 닉네임에 쓸 수 없는 글자가 있거나 32자를 넘습니다. 글자·숫자·`_ - .`와 낱말 사이 한 칸 공백만 됩니다 |
 | `cannot use --units ...` | manifest 파일이 없거나 깨졌거나(해시 불일치, 비어 있음) 형식이 다릅니다 |
 | worker가 `waiting_next_round`만 출력 | 정상입니다. round 도중에 합류해서 다음 round를 기다리는 중입니다 |
 | Hub push가 `failed` | `coordinator_state.json`의 `hub_push.versions`에서 오류를 확인하고 `POST /hub-push`로 재시도하세요. 토큰은 오류 메시지에서 가려집니다 |

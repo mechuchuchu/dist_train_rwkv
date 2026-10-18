@@ -523,3 +523,273 @@ class LeanAggregationTests(unittest.TestCase):
         self.assertEqual(after[2], 1)
         self.assertEqual(after[1], tensor_map_sha256(decode_tensors(after[0])))
         self.assertEqual(first[1], tensor_map_sha256(decode_tensors(first[0])))
+
+
+class NicknameTests(unittest.TestCase):
+    def test_usable_nicknames_are_kept_as_written(self):
+        for text in ("alice", "Alice_01", "김철수", "my gpu", "rig-3.v2", "日本語 ユーザー", "a"):
+            with self.subTest(nickname=text):
+                self.assertEqual(rwkv_dist_protocol.normalize_nickname(text), text)
+
+    def test_surrounding_space_is_dropped_and_look_alike_forms_are_unified(self):
+        normalize = rwkv_dist_protocol.normalize_nickname
+        self.assertEqual(normalize("  alice \t"), "alice")
+        self.assertEqual(normalize("ａｌｉｃｅ"), "alice")  # full-width letters
+        self.assertEqual(normalize("ﬁsh"), "fish")  # ligature
+
+    def test_the_length_limit_counts_characters(self):
+        normalize = rwkv_dist_protocol.normalize_nickname
+        self.assertEqual(len(normalize("가" * 32)), 32)
+        with self.assertRaisesRegex(ValueError, "at most 32"):
+            normalize("가" * 33)
+
+    def test_nicknames_that_could_confuse_a_log_or_a_terminal_are_refused(self):
+        for text in ("", "   ", "a\nb", "a\tb", "a  b", "\x1b[31mred", "<b>", "a/b", "a\\b", "x;y",
+                     'say "hi"', "(anonymous)", "a‮b", "a​b", "😀"):
+            with self.subTest(nickname=text):
+                with self.assertRaises(ValueError):
+                    rwkv_dist_protocol.normalize_nickname(text)
+
+    def test_only_text_is_accepted(self):
+        for value in (None, 5, b"alice", ["alice"]):
+            with self.subTest(value=value):
+                with self.assertRaisesRegex(ValueError, "must be text"):
+                    rwkv_dist_protocol.normalize_nickname(value)
+
+
+class ContributorLedgerTests(unittest.TestCase):
+    def setUp(self):
+        self.coordinator = self.make()
+
+    def make(self, contributions=None) -> RoundCoordinator:
+        return RoundCoordinator(
+            theta={"lora_A": torch.zeros(2), "lora_B": torch.zeros(1)},
+            units=[make_unit("unit-0", 2), make_unit("unit-1", 6)],
+            run_id="ledger", base={"revision": "pinned"}, tokenizer={"hash": "pinned"},
+            worker_code_sha256="worker-code", target_loss_tokens=8, min_units=2,
+            lease_seconds=30, learning_rate=1e-2, contributions=contributions,
+        )
+
+    def submit(self, worker_id, *, coordinator=None, value=1.0, **overrides):
+        coordinator = coordinator or self.coordinator
+        lease = coordinator.lease(worker_id)
+        payload = encode_tensors({"lora_A": torch.full((2,), value), "lora_B": torch.full((1,), value)})
+        metadata = make_metadata(lease, lease["unit"], payload) | overrides
+        return coordinator.submit_result(metadata, payload)
+
+    def next_round(self, names=("unit-2", "unit-3")):
+        self.coordinator.start_next_round(
+            [make_unit(names[0], 2), make_unit(names[1], 6)], target_loss_tokens=8, min_units=2)
+
+    def test_a_nickname_is_remembered_with_the_worker_and_logged_once(self):
+        self.coordinator.join("gpu-a", "alice")
+        self.coordinator.join("gpu-a", "alice")
+        joined = [e for e in self.coordinator.events if e["event"] == "worker_joined"]
+        self.assertEqual(len(joined), 1)
+        self.assertEqual(joined[0]["nickname"], "alice")
+        self.assertEqual(self.coordinator.nicknames, {"gpu-a": "alice"})
+
+    def test_the_nickname_is_normalised_before_it_is_stored(self):
+        self.coordinator.join("gpu-a", "  ａｌｉｃｅ ")
+        self.assertEqual(self.coordinator.nicknames["gpu-a"], "alice")
+
+    def test_an_unusable_nickname_admits_nobody(self):
+        with self.assertRaises(ProtocolError) as caught:
+            self.coordinator.join("gpu-a", "bad\nname")
+        self.assertEqual((caught.exception.code, caught.exception.status), ("invalid_nickname", 400))
+        self.assertNotIn("gpu-a", self.coordinator.active_workers)
+        self.assertEqual(self.coordinator.nicknames, {})
+
+    def test_joining_again_decides_the_nickname_anew(self):
+        self.coordinator.join("gpu-a", "alice")
+        self.coordinator.join("gpu-a", "alice2")
+        self.assertEqual(self.coordinator.nicknames["gpu-a"], "alice2")
+        self.coordinator.join("gpu-a")  # restarted without --contribute
+        self.assertEqual(self.coordinator.nicknames, {})
+
+    def test_an_accepted_unit_carries_who_it_is_credited_to_and_how_long_it_took(self):
+        self.coordinator.join("gpu-a", "alice")
+        self.coordinator.join("gpu-b")
+        self.submit("gpu-a", compute_seconds=1.5)
+        self.submit("gpu-b", compute_seconds=2.0)
+        named, anonymous = self.coordinator.accepted.values()
+        self.assertEqual((named["nickname"], named["compute_seconds"]), ("alice", 1.5))
+        self.assertNotIn("nickname", anonymous)
+        self.assertEqual(anonymous["compute_seconds"], 2.0)
+
+    def test_the_reported_time_is_informational_and_made_safe(self):
+        cases = [(float("nan"), 0.0), (-3.0, 0.0), ("x", 0.0), (None, 0.0), (float("inf"), 0.0),
+                 (1e9, 86400.0), ("2.5", 2.5)]
+        for reported, expected in cases:
+            with self.subTest(reported=reported):
+                coordinator = self.make()
+                coordinator.join("w")
+                self.submit("w", coordinator=coordinator, compute_seconds=reported)
+                self.assertEqual(next(iter(coordinator.accepted.values()))["compute_seconds"], expected)
+
+    def test_credit_is_given_when_the_step_closes_not_before(self):
+        self.coordinator.join("gpu-a", "alice")
+        self.submit("gpu-a")
+        self.assertEqual(self.coordinator.export_contributions(), {})
+        live = self.coordinator.contributors()
+        self.assertEqual([(c["nickname"], c["units"], c["loss_tokens"]) for c in live], [("alice", 1, 2)])
+
+        closed = self.submit("gpu-a")["round_closed"]
+
+        self.assertTrue(closed)
+        ledger = self.coordinator.export_contributions()
+        self.assertEqual(ledger["alice"]["units"], 2)
+        self.assertEqual(ledger["alice"]["loss_tokens"], 8)
+        self.assertEqual(ledger["alice"]["steps"], 1)
+        # the live view of a closed round is the ledger, not the ledger plus the same units again
+        self.assertEqual(self.coordinator.contributors()[0]["units"], 2)
+
+    def test_a_rejected_result_earns_nothing(self):
+        self.coordinator.join("gpu-a", "alice")
+        with self.assertRaises(ProtocolError):
+            self.submit("gpu-a", gradient_sha256="0" * 64)
+        self.assertEqual(self.coordinator.contributors(), [])
+        self.assertEqual(self.coordinator.export_contributions(), {})
+
+    def test_workers_sharing_a_nickname_are_pooled_and_the_step_counts_once(self):
+        self.coordinator.join("laptop", "alice")
+        self.coordinator.join("desktop", "alice")
+        self.submit("laptop")
+        self.submit("desktop")
+        entry = self.coordinator.export_contributions()["alice"]
+        self.assertEqual((entry["units"], entry["loss_tokens"], entry["steps"]), (2, 8, 1))
+
+    def test_the_ledger_accumulates_over_steps_and_counts_each_step_a_person_took_part_in(self):
+        self.coordinator.join("a", "alice")
+        self.coordinator.join("b", "bob")
+        self.submit("a")
+        self.submit("b")
+        self.next_round()
+        self.submit("a")
+        self.submit("a")
+        ledger = self.coordinator.export_contributions()
+        self.assertEqual((ledger["alice"]["units"], ledger["alice"]["steps"]), (3, 2))
+        self.assertEqual((ledger["bob"]["units"], ledger["bob"]["steps"]), (1, 1))
+
+    def test_anonymous_work_is_kept_apart_under_a_name_nobody_can_choose(self):
+        self.coordinator.join("a", "alice")
+        self.coordinator.join("b")
+        self.submit("a")
+        self.submit("b")
+        ledger = self.coordinator.export_contributions()
+        self.assertEqual(set(ledger), {"alice", rwkv_dist_protocol.ANONYMOUS})
+        self.assertEqual(rwkv_dist_protocol.ANONYMOUS, "(anonymous)")
+
+    def test_a_worker_that_changes_nickname_is_credited_as_each_unit_was_done(self):
+        self.coordinator.join("a", "alice")
+        self.submit("a")
+        self.coordinator.join("a", "alicia")
+        self.submit("a")
+        ledger = self.coordinator.export_contributions()
+        self.assertEqual({name: entry["units"] for name, entry in ledger.items()},
+                         {"alice": 1, "alicia": 1})
+
+    def test_the_closed_step_reports_who_took_part_and_how_long_it_took(self):
+        self.coordinator.join("a", "alice")
+        self.coordinator.join("b")
+        self.submit("a", compute_seconds=1.25)
+        self.submit("b", compute_seconds=0.75)
+        metrics = self.coordinator.close_metrics
+        self.assertEqual(metrics["contributors"], {
+            "alice": {"units": 1, "loss_tokens": 2, "compute_seconds": 1.25},
+            "(anonymous)": {"units": 1, "loss_tokens": 6, "compute_seconds": 0.75},
+        })
+        self.assertGreaterEqual(metrics["round_seconds"], 0.0)
+        self.assertLess(metrics["round_seconds"], 60.0)
+
+    def test_a_steps_duration_counts_from_the_first_unit_handed_out(self):
+        clock = [1000.0]
+        with patch.object(rwkv_dist_protocol.time, "time", lambda: clock[0]):
+            self.coordinator.join("a", "alice")
+            clock[0] += 3600.0           # the round sat open, waiting for its first worker
+            self.submit("a")
+            clock[0] += 7.0
+            self.submit("a")
+        self.assertEqual(self.coordinator.close_metrics["round_seconds"], 7.0)
+
+    def test_the_next_step_is_timed_from_its_own_first_unit(self):
+        clock = [1000.0]
+        with patch.object(rwkv_dist_protocol.time, "time", lambda: clock[0]):
+            self.coordinator.join("a", "alice")
+            self.submit("a")
+            clock[0] += 5.0
+            self.submit("a")
+            clock[0] += 1000.0
+            self.next_round()
+            self.coordinator.join("a", "alice")
+            clock[0] += 1000.0
+            self.submit("a")
+            clock[0] += 2.0
+            self.submit("a")
+        self.assertEqual(self.coordinator.close_metrics["round_seconds"], 2.0)
+
+    def test_the_listing_is_ordered_by_validated_work_then_name(self):
+        self.coordinator.join("a", "zed")
+        self.coordinator.join("b", "amy")
+        self.coordinator.join("c", "bo")
+        self.submit("a")  # zed: 2 loss tokens
+        self.submit("b")  # amy: 6 loss tokens
+        self.next_round()
+        self.coordinator.join("b", "amy")
+        self.submit("c")
+        self.submit("c")
+        order = [(c["nickname"], c["loss_tokens"]) for c in self.coordinator.contributors()]
+        self.assertEqual(order, [("bo", 8), ("amy", 6), ("zed", 2)])
+
+    def test_equal_work_is_listed_by_name(self):
+        credit = {"units": 1, "loss_tokens": 5, "steps": 1, "compute_seconds": 0.0}
+        ranked = rwkv_dist_protocol.rank_contributions({"bob": dict(credit), "Zoe": dict(credit),
+                                                        "amy": dict(credit)})
+        self.assertEqual([entry["nickname"] for entry in ranked], ["Zoe", "amy", "bob"])
+
+    def test_anonymous_work_comes_after_named_work_it_ties_with(self):
+        credit = {"units": 1, "loss_tokens": 5, "steps": 1, "compute_seconds": 0.0}
+        ranked = rwkv_dist_protocol.rank_contributions({"bob": dict(credit), "(anonymous)": dict(credit)})
+        self.assertEqual([entry["nickname"] for entry in ranked], ["bob", "(anonymous)"])
+        ranked = rwkv_dist_protocol.rank_contributions(
+            {"bob": dict(credit), "(anonymous)": {**credit, "loss_tokens": 9}})
+        self.assertEqual([entry["nickname"] for entry in ranked], ["(anonymous)", "bob"])
+
+    def test_a_saved_ledger_is_continued_by_the_next_coordinator(self):
+        self.coordinator.join("a", "alice")
+        self.submit("a")
+        self.submit("a")
+        saved = self.coordinator.export_contributions()
+
+        resumed = self.make(contributions=saved)
+        resumed.join("a", "alice")
+        self.submit("a", coordinator=resumed)
+        self.submit("a", coordinator=resumed)
+
+        entry = resumed.export_contributions()["alice"]
+        self.assertEqual((entry["units"], entry["loss_tokens"], entry["steps"]), (4, 16, 2))
+
+    def test_a_ledger_does_not_alias_the_coordinators_own(self):
+        self.coordinator.join("a", "alice")
+        self.submit("a")
+        self.submit("a")
+        exported = self.coordinator.export_contributions()
+        exported["alice"]["units"] = 999
+        self.assertEqual(self.coordinator.export_contributions()["alice"]["units"], 2)
+
+    def test_a_malformed_saved_ledger_is_refused(self):
+        good = {"units": 1, "loss_tokens": 2, "steps": 1, "compute_seconds": 0.5}
+        cases = {
+            "missing field": {"alice": {"units": 1}},
+            "text count": {"alice": {**good, "units": "many"}},
+            "negative": {"alice": {**good, "loss_tokens": -1}},
+            "not a number": {"alice": {**good, "compute_seconds": float("nan")}},
+            "not a record": {"alice": 5},
+        }
+        for label, saved in cases.items():
+            with self.subTest(case=label):
+                with self.assertRaises(ValueError):
+                    self.make(contributions=saved)
+        with self.assertRaises(ValueError):
+            self.make(contributions={"bad\nname": good})
+        self.make(contributions={"(anonymous)": good, "alice": good})  # both are fine
