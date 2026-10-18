@@ -1,0 +1,14 @@
+# Python bytecode and test/tool caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Generated model-weight artifacts; keep JSON manifests and validation reports trackable.
+/artifacts/**/*.safetensors
+
+# Local training outputs
+/checkpoints/
+/outputs/
+/runs/
