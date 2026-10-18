@@ -27,6 +27,7 @@ coordinator ───────────────────▶ worker 
 | `rwkv_dist_client.py` | worker 쪽 HTTP 클라이언트, 재접속 대기 |
 | `rwkv_dist_checkpoint.py` | coordinator 체크포인트(원자적 저장, 검증, 호환성 검사) |
 | `rwkv_hub.py` | Hugging Face 모델 내려받기, adapter push, Hub 체크포인트 조회 |
+| `rwkv_new_tokens.py` | 변환된 체크포인트가 어휘에 덧붙인 토큰(id 65536 이상)의 임베딩/헤드 행을 학습 가능하게 만드는 hook ([새 토큰 행 학습](#새-토큰-행-학습-변환된-체크포인트)) |
 | `prepare_g1j_protocol_units.py` | 샘플 unit manifest 생성 (4개 행짜리 프로토콜 검증용). `--model-id` 등으로 다른 모델의 tokenizer를 쓸 수 있음 |
 | `make_initial_adapter.py` | 새 실행의 출발점이 되는 깨끗한 rank-8 LoRA adapter 생성 (CUDA 필요). 모델 크기는 모델 자체에서 읽음 |
 | `validate_g1j_sft_protocol.py` | TRL로 2 step 학습해 보는 프로토콜 검증 스크립트(adapter도 하나 남김) |
@@ -177,6 +178,33 @@ python g1j_dist_worker.py $M --server http://...                         # 모�
 - `--model-dir`에 `config.json`이 없으면 초기 adapter는 구조만 검사하고(알림 출력) 정확한 이름·shape는 worker가 `apply_snapshot`에서 확인합니다.
 - **확인하지 못한 것.** 1.5B 외의 실제 가중치로 로드/학습해 본 적이 없고, 크기별 repo의 `release-manifest.json`·tokenizer 파일 구성과 chat template의 assistant mask 지원도 직접 확인하지 않았습니다(`prepare_g1j_protocol_units.py`는 `return_assistant_tokens_mask`가 되는 tokenizer를 가정합니다). 큰 모델은 BF16 base 메모리(위 요구사항 참고)와 unit당 업로드 크기(`/result` 상한은 128 MiB)가 커집니다.
 
+## 새 토큰 행 학습 (변환된 체크포인트)
+
+RWKV World tokenizer의 id는 0..65535입니다. K2 Horizon처럼 다른 chat 형식으로 변환한 체크포인트는 그 뒤에 special token을 덧붙이고 임베딩과 LM head를 그만큼 키웁니다. 새 행은 기존 행의 평균으로 초기화돼 있을 뿐이라 SFT가 가르쳐야 하는 대상이고, 이 프로젝트는 LoRA와 함께 그 행들을 학습합니다.
+
+- **자동으로 켜집니다.** `config.json`의 `vocab_size`가 65536보다 크면 그 차이 `N`만큼이 새 토큰 행입니다. 옵션은 없고, 65536이면(일반 RWKV7) 이전과 똑같이 LoRA만 학습합니다.
+- **원래 행렬을 학습하지 않고, 새 행에 더하는 델타만 학습합니다.** `임베딩(id) = 기본 임베딩(id) + embedding_delta[id − 65536]`, `logit(id) = 기본 logit(id) + hidden · head_delta[id − 65536]` (id ≥ 65536일 때만). 델타는 0에서 시작하는 fp32 `(N, 폭)` 행렬 두 개(`new_token_rows.embedding_delta`, `new_token_rows.head_delta`)로, 다른 θ 텐서와 똑같이 합산·AdamW·체크포인트·Hub push 대상입니다. 기본 가중치는 얼린 채라 worker는 체크포인트 외에 필요한 게 없습니다. 임베딩과 head 전체를 학습하면 매 round `(65536+N) × 폭` 행렬 두 개(1.5B에서 1 GB 넘게)를 주고받아야 해서 대상이 아닙니다.
+- **비용.** unit당 업로드와 θ 스냅샷이 `N × 폭 × 2 × 4 B`만큼 늘어납니다(예: N=200, 폭 2048이면 약 3.1 MiB. LoRA는 12 MiB). 학습률은 LoRA와 같은 값 하나입니다. 새 행에는 더 큰 값이 필요할 수 있지만 따로 조절하는 옵션은 없습니다.
+- **저장 위치.** 델타는 `adapter_model.safetensors`에 LoRA와 같은 파일로 들어갑니다(이름은 위와 같고 `theta.safetensors`에도 같은 이름). PEFT는 이 텐서를 무시하고 LoRA만 로드합니다(테스트로 확인). 추론에서 쓰려면 직접 더하세요.
+
+  ```python
+  rows = safetensors.torch.load_file("<run-dir>/adapter_model.safetensors")
+  with torch.no_grad():
+      model.get_input_embeddings().weight[65536:] += rows["new_token_rows.embedding_delta"].to(device)
+      model.get_output_embeddings().weight[65536:] += rows["new_token_rows.head_delta"].to(device)
+  ```
+
+  `validate_g1j_dist_checkpoint.py --model-path <모델>`은 이 행들을 파일과 θ 사이에서 대조하고 probe loss에도 반영합니다.
+- **forward hook으로 구현했습니다.** `get_input_embeddings()`와 `get_output_embeddings()` 모듈의 출력에 델타를 더하므로 모델 내부 구조에 의존하지 않습니다. head 델타는 fp32로 더하고 logits를 fp32로 돌려줘서, bf16 해상도보다 작은 갱신이 반올림으로 사라지지 않습니다. 모델이 두 모듈을 거치지 않고 `lm_head.weight`를 직접 읽으면(fused cross-entropy 등) 새 행의 gradient가 조용히 0이 되므로, worker가 매 unit마다 hook이 불렸는지 확인하고 아니면 `RuntimeError`로 멈춥니다.
+- **coordinator와 worker가 어긋나면** 스냅샷을 적용하는 단계에서 `tensor schema mismatch`로 멈춥니다. `rwkv_new_tokens.py`가 worker 번들 해시에 들어가므로 이전 버전 worker는 `bundle hash`에서 먼저 막힙니다.
+- **학습하지 않는 것.** head에 bias가 있어도(RWKV7 HF 모델에 있는지는 확인하지 못했습니다) bias는 얼립니다. 기존 65536개 행도 얼립니다.
+
+**변환된 체크포인트를 쓰려면** 아직 맞춰야 할 것이 있습니다(직접 검증하지 못했습니다).
+
+- 이 프로젝트는 모델 폴더에 `release-manifest.json`(그 안의 `conversion.serialized_parameter_count` 포함)이 있고, 모델이 40자리 commit으로 고정된 Hugging Face repo이기를 기대합니다. 변환 스크립트는 `release-manifest.json`을 만들지 않으므로, 변환 결과를 자신의 HF repo에 올려 commit을 고정하고 그 폴더에 manifest를 두어야 합니다.
+- `prepare_g1j_protocol_units.py`는 `apply_chat_template(..., return_assistant_tokens_mask=True)`를 씁니다. K2 Horizon의 chat template은 assistant 턴을 `{% generation %}`으로 감싸 이 방식이 되는 것으로 보이지만, template 내용을 요약으로만 확인했는데, assistant 메시지에 reasoning 필드(`reasoning_content` 등)가 없으면 에러를 내는 것으로 보입니다. 실제 데이터로 실행해 확인해야 합니다. 이 스크립트의 데이터는 Capybara 4개 행으로 고정된 검증용입니다.
+- EOS가 여러 개(`eos_token_id` 목록)인 모델이어도 LoRA/새 행 스키마에는 영향이 없습니다.
+
 ## coordinator가 쓰는 자원
 
 coordinator는 GPU와 모델 가중치 없이 CPU와 디스크만 쓰고, 메모리는 **unit 수나 동시에 올리는 worker 수에 거의 늘어나지 않게** 만들었습니다.
@@ -281,7 +309,7 @@ python g1j_dist_coordinator.py ... \
 
 | 경로 | 내용 |
 | --- | --- |
-| `adapter_model.safetensors`, `adapter_config.json` | 현재 adapter (PEFT 형식). `PeftModel.from_pretrained(base, run_dir)`로 로드 |
+| `adapter_model.safetensors`, `adapter_config.json` | 현재 adapter (PEFT 형식). `PeftModel.from_pretrained(base, run_dir)`로 로드. 새 토큰 행을 학습했다면 그 델타 텐서도 같은 파일에 들어 있고 PEFT는 무시합니다 |
 | `theta.safetensors` | coordinator 내부 이름의 같은 텐서 |
 | `ckpt/theta-NNNNNN/` | resume용 체크포인트 |
 | `coordinator_state.json` | 현재 round, 해시, 인정된 결과 요약, Hub push 상태 |
@@ -304,14 +332,14 @@ python g1j_dist_coordinator.py ... \
 python -m unittest discover -p "test_*.py"
 ```
 
-GPU 없이 약 55초에 292개가 돕니다. worker 테스트는 `transformers`/`peft`를 가짜로 대체해서 제어 흐름을 검증합니다. `test_make_initial_adapter.py`는 반대로 진짜 PEFT를 쓰고(RWKV와 같은 모듈 구조의 빈 껍데기 모델 위에서, 24×2048 / 32×2560 / 32×4096), `transformers`/`peft`가 없으면(`requirements-worker.txt`를 설치하지 않으면) 건너뜁니다(34개, 나머지 258개는 그대로 통과). `test_model_schema.py`는 크기별 스키마와 모델 이름에서 파생되는 경로/실행 이름을, `test_prepare_units.py`는 `datasets`/tokenizer를 가짜로 대체해 데이터 shard가 모델 신원을 기록하고 coordinator가 그 모델에서만 받아들이는지를 검증합니다. coordinator 테스트는 실제 HTTP 서버를 띄워 합성 gradient로 여러 round, 재시작, Hub 왕복(가짜 Hub)까지 검증합니다. 실제 모델 계산, 실제 Hugging Face 서버 호출, 여러 GPU 동시 실행은 이 테스트에 포함되지 않습니다.
+GPU 없이 약 80초에 373개가 돕니다. worker 테스트는 `transformers`/`peft`를 가짜로 대체해서 제어 흐름을 검증합니다. `test_make_initial_adapter.py`는 반대로 진짜 PEFT를 쓰고(RWKV와 같은 모듈 구조의 빈 껍데기 모델 위에서, 24×2048 / 32×2560 / 32×4096), `transformers`/`peft`가 없으면(`requirements-worker.txt`를 설치하지 않으면) 건너뜁니다(44개, 나머지 329개는 그대로 통과). `test_model_schema.py`는 크기별 스키마와 모델 이름에서 파생되는 경로/실행 이름을, `test_prepare_units.py`는 `datasets`/tokenizer를 가짜로 대체해 데이터 shard가 모델 신원을 기록하고 coordinator가 그 모델에서만 받아들이는지를 검증합니다. `test_new_tokens.py`는 새 토큰 행의 델타가 "그 행을 직접 학습한 모델"과 같은 logits/gradient를 내는지(작은 모델과, PEFT·gradient checkpointing을 켠 작은 Llama 위에서), 기존 resume/Hub 테스트를 θ에 새 행을 넣어 다시 돌려 저장·push·복원이 되는지를, `test_worker_model.py`는 진짜 `load_worker_model`/`compute_unit`/`apply_snapshot`이 작은 Llama 위에서 새 행을 다루는지와 worker 번들이 import하는 모듈을 빠짐없이 담는지를 검증합니다. coordinator 테스트는 실제 HTTP 서버를 띄워 합성 gradient로 여러 round, 재시작, Hub 왕복(가짜 Hub)까지 검증합니다. 실제 모델 계산, 실제 Hugging Face 서버 호출, 여러 GPU 동시 실행은 이 테스트에 포함되지 않습니다.
 
 ## 보안과 한계
 
 - **평문 HTTP + 공유 토큰 하나.** TLS, worker별 인증, 서명이 없습니다. 기본 바인딩은 루프백이고, 외부 네트워크에 노출하지 마세요. 원격 worker는 TLS를 앞에 두는 구성이 먼저 필요합니다.
 - 결과 검증은 형식, 유한성, 토큰 수, 해시까지입니다. 그럴듯한 가짜 gradient를 보내는 악의적 worker는 막지 못합니다(canary/감사 없음).
 - HF 쓰기 토큰은 coordinator에만 넘기세요. worker에는 토큰 옵션이 없습니다.
-- LoRA 설정은 고정입니다(rank 8 / alpha 16, attention 4개 projection). 모델은 크기와 관계없이 쓸 수 있지만 1.5B 외에는 실제 가중치로 검증하지 않았습니다. **QLoRA는 분산 worker에 연결돼 있지 않습니다**(worker는 BF16 base만 로드). 추가 special-token 행 학습도 없습니다.
+- LoRA 설정은 고정입니다(rank 8 / alpha 16, attention 4개 projection). 모델은 크기와 관계없이 쓸 수 있지만 1.5B 외에는 실제 가중치로 검증하지 않았습니다. **QLoRA는 분산 worker에 연결돼 있지 않습니다**(worker는 BF16 base만 로드). 추가 special-token 행은 학습하지만([새 토큰 행 학습](#새-토큰-행-학습-변환된-체크포인트)) 임베딩/head 전체를 학습하는 옵션은 없습니다.
 - 진행 중인 round는 복구하지 않습니다(위 resume 절).
 - 알려진 남은 작업(timeout 기반 부분 step 종료, 중복 lease, 동시 worker 검증, 분산 동등성 허용오차 등)은 `G1j_1.5B_Training_Protocol_Validation_2026-10-18.md`에 정리돼 있습니다.
 
@@ -319,7 +347,7 @@ GPU 없이 약 55초에 292개가 돕니다. worker 테스트는 `transformers`/
 
 | 메시지 | 원인과 조치 |
 | --- | --- |
-| `worker bundle hash does not match coordinator's pinned code` | worker와 coordinator의 `g1j_dist_worker.py`, `rwkv_dist_protocol.py`, `rwkv_dist_client.py`, `rwkv_hub.py`가 다릅니다. 같은 커밋을 쓰고, 이 파일들을 바꾼 뒤에는 coordinator와 worker를 **같이** 재시작하세요 |
+| `worker bundle hash does not match coordinator's pinned code` | worker와 coordinator의 `g1j_dist_worker.py`, `rwkv_dist_protocol.py`, `rwkv_new_tokens.py`, `rwkv_dist_client.py`, `rwkv_hub.py`가 다릅니다. 같은 커밋을 쓰고, 이 파일들을 바꾼 뒤에는 coordinator와 worker를 **같이** 재시작하세요 |
 | `coordinator run changed after reconnect` | worker가 이전 `run_id`를 기억하고 있습니다. 새 run(`--resume` 없이 시작)을 띄웠다면 worker도 재시작하세요 |
 | `<run-dir>/ckpt already holds checkpoints; pass --resume ...` | 이어갈 거면 `--resume`, 새로 시작할 거면 다른 `--run-dir` |
 | `cannot resume: checkpoint belongs to a different run configuration: ...` | 메시지에 나온 항목(데이터, plan, 학습률 등)을 원래 실행과 같게 맞추세요 |

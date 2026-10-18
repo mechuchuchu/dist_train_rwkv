@@ -20,6 +20,8 @@ from safetensors import safe_open
 from safetensors.torch import load as load_safetensors
 from safetensors.torch import save as save_safetensors
 
+from rwkv_new_tokens import NEW_TOKEN_TENSORS
+
 
 def model_name(model_id: str) -> str:
     """'RWKV/RWKV7-G1j-1.5B-20260831' -> 'RWKV7-G1j-1.5B-20260831'."""
@@ -103,6 +105,25 @@ def parameter_name_to_peft_saved_name(name: str) -> str:
         if name.endswith(suffix):
             return name[: -len(suffix)] + f".{factor}.weight"
     raise ValueError(f"Not a supported PEFT LoRA parameter name: {name}")
+
+
+def is_saved_theta_name(name: str) -> bool:
+    """Whether a tensor in an adapter file is part of theta (LoRA weight or new-token row)."""
+    return name in NEW_TOKEN_TENSORS or ".lora_A." in name or ".lora_B." in name
+
+
+def theta_name_from_saved(name: str) -> str:
+    """Name of a tensor in an adapter file -> its name in theta. New-token rows keep theirs."""
+    if name in NEW_TOKEN_TENSORS:
+        return name
+    return peft_saved_name_to_parameter_name(name)
+
+
+def saved_name_from_theta(name: str) -> str:
+    """Name of a theta tensor -> its name in an adapter file. New-token rows keep theirs."""
+    if name in NEW_TOKEN_TENSORS:
+        return name
+    return parameter_name_to_peft_saved_name(name)
 
 
 def encode_tensors(tensors: dict[str, torch.Tensor]) -> bytes:

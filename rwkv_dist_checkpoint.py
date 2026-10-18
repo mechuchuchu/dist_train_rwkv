@@ -28,7 +28,7 @@ from typing import Any
 import torch
 from safetensors.torch import load_file, save_file
 
-from rwkv_dist_protocol import peft_saved_name_to_parameter_name, tensor_map_sha256
+from rwkv_dist_protocol import is_saved_theta_name, tensor_map_sha256, theta_name_from_saved
 
 
 CHECKPOINT_FORMAT = "rwkv-coordinator-ckpt-v1"
@@ -242,9 +242,9 @@ def load_hub_checkpoint(directory: Path) -> LoadedCheckpoint:
         raise ResumeError(f"{directory}: cannot read {HUB_ADAPTER_FILE}: {exc}") from exc
     theta = {}
     for name, tensor in raw.items():
-        if ".lora_A." not in name and ".lora_B." not in name:
+        if not is_saved_theta_name(name):
             continue
-        theta[peft_saved_name_to_parameter_name(name)] = tensor.float().contiguous()
+        theta[theta_name_from_saved(name)] = tensor.float().contiguous()
     if not theta or tensor_map_sha256(theta) != metadata["theta_hash"]:
         raise ResumeError(f"{directory}: adapter does not match the theta hash it was pushed with")
     optimizer_tensors: dict[str, torch.Tensor] = {}

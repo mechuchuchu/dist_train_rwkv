@@ -1069,10 +1069,10 @@ class HubPushRecoveryTests(unittest.TestCase):
         tensors = load_file(str(entry / "adapter_model.safetensors"))
         tensors = {name: value + 1.0 for name, value in tensors.items()}
         save_file(tensors, str(entry / "adapter_model.safetensors"))
-        from rwkv_dist_protocol import peft_saved_name_to_parameter_name
+        from rwkv_dist_protocol import theta_name_from_saved
         metadata = json.loads((entry / "metadata.json").read_text())
         metadata["theta_hash"] = tensor_map_sha256(
-            {peft_saved_name_to_parameter_name(n): t for n, t in tensors.items()})
+            {theta_name_from_saved(n): t for n, t in tensors.items()})
         (entry / "metadata.json").write_text(json.dumps(metadata))
 
         app, report = self.resume(hf_push_every_steps=10)

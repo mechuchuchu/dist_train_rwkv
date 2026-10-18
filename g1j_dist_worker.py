@@ -42,6 +42,7 @@ from rwkv_dist_protocol import (
     unit_digest,
 )
 from rwkv_hub import ensure_hf_checkpoint
+from rwkv_new_tokens import attach_new_token_rows
 
 
 # The model a worker serves unless --model-id/--model-revision say otherwise. The
@@ -88,6 +89,9 @@ def load_worker_model(model_path: Path) -> torch.nn.Module:
             target_modules=TARGET_MODULES,
         ),
     )
+    # Ids past the RWKV World vocabulary (a converted checkpoint's added special tokens) get
+    # trainable embedding and LM-head rows next to the LoRA; none for a plain RWKV7.
+    attach_new_token_rows(model, hf_model=model.get_base_model())
     model.train()
     return model
 
@@ -125,7 +129,12 @@ def compute_unit(model, params, unit: dict):
     if loss_tokens != int(unit["loss_tokens"]):
         raise RuntimeError("unit manifest loss-token count does not match labels")
     model.zero_grad(set_to_none=True)
+    new_token_rows = getattr(model, "new_token_rows", None)
+    if new_token_rows is not None:
+        new_token_rows.reset_calls()
     output = model(input_ids=input_ids, attention_mask=attention_mask, use_cache=False)
+    if new_token_rows is not None:
+        new_token_rows.require_used()
     shifted_logits = output.logits[:, :-1, :].contiguous().float()
     shifted_labels = labels[:, 1:].contiguous()
     loss_sum = F.cross_entropy(

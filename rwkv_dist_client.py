@@ -13,6 +13,7 @@ from typing import Callable
 WORKER_BUNDLE_FILES = (
     "g1j_dist_worker.py",
     "rwkv_dist_protocol.py",
+    "rwkv_new_tokens.py",
     "rwkv_dist_client.py",
     "rwkv_hub.py",
 )

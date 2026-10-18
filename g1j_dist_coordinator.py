@@ -40,15 +40,18 @@ from rwkv_dist_protocol import (
     canonical_json,
     default_model_dir,
     model_slug,
-    parameter_name_to_peft_saved_name,
+    is_saved_theta_name,
     peft_saved_name_to_parameter_name,
     rank_contributions,
     restore_contributions,
+    saved_name_from_theta,
     sha256_bytes,
     tensor_map_sha256,
+    theta_name_from_saved,
     unit_digest,
 )
 from rwkv_dist_client import WORKER_BUNDLE_FILES
+from rwkv_new_tokens import BASE_VOCAB_SIZE, new_token_count, new_token_shapes
 from rwkv_hub import (
     OPTIMIZER_FILE,
     OPTIMIZER_POLICIES,
@@ -160,6 +163,25 @@ def read_model_shape(model_dir: Path) -> tuple[int, int] | None:
         raise ValueError(f"{config_path} lacks num_hidden_layers / hidden_size") from exc
 
 
+def read_new_token_count(model_dir: Path) -> int:
+    """How many token ids the snapshot adds beyond the RWKV World vocabulary (0 for plain RWKV7).
+
+    A checkpoint converted to another chat format grows its vocabulary past 65,536; the
+    rows of those ids are trained along with the LoRA (see rwkv_new_tokens.py). A
+    config.json without vocab_size counts as none, and workers refuse a mismatch.
+    """
+    config_path = model_dir / "config.json"
+    if not config_path.is_file():
+        return 0
+    config = json.loads(config_path.read_text())
+    if not isinstance(config, dict) or "vocab_size" not in config:
+        return 0
+    try:
+        return new_token_count(int(config["vocab_size"]))
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{config_path}: {exc}") from exc
+
+
 def check_lora_structure(theta: dict[str, torch.Tensor]) -> tuple[int, int]:
     """Check that `theta` is a complete rank-8 attention LoRA; return (layers, hidden size)."""
     if not theta:
@@ -190,9 +212,13 @@ def check_lora_structure(theta: dict[str, torch.Tensor]) -> tuple[int, int]:
     return len(layers), widths.pop()
 
 
-def load_initial_theta(adapter_dir: Path, *,
-                       model_shape: tuple[int, int] | None = None) -> dict[str, torch.Tensor]:
-    """Read the starting adapter; with `model_shape` (layers, hidden) also match it to that model."""
+def load_initial_theta(adapter_dir: Path, *, model_shape: tuple[int, int] | None = None,
+                       new_tokens: int = 0) -> dict[str, torch.Tensor]:
+    """Read the starting adapter; with `model_shape` (layers, hidden) also match it to that model.
+
+    `new_tokens` is the number of appended vocabulary ids (see read_new_token_count); their
+    trainable rows start at zero, so they are not read from the adapter files.
+    """
     missing = [name for name in ("adapter_config.json", "adapter_model.safetensors")
                if not (adapter_dir / name).is_file()]
     if missing:
@@ -215,6 +241,8 @@ def load_initial_theta(adapter_dir: Path, *,
             f"run's base model has {model_shape[0]} layers of width {model_shape[1]}; create a "
             f"matching one with make_initial_adapter.py"
         )
+    for name, shape in new_token_shapes(new_tokens, width).items():
+        theta[name] = torch.zeros(shape, dtype=torch.float32)
     return theta
 
 
@@ -588,7 +616,7 @@ class Application:
     def persist_checkpoint(self) -> None:
         with self.persist_lock:
             self.save_resume_checkpoint()
-            state = {parameter_name_to_peft_saved_name(k): v for k, v in self.coordinator.theta.items()}
+            state = {saved_name_from_theta(k): v for k, v in self.coordinator.theta.items()}
             adapter_path = self.run_dir / "adapter_model.safetensors"
             temp = self.run_dir / "adapter_model.tmp"
             save_file(state, str(temp))
@@ -672,8 +700,8 @@ class Application:
         try:
             raw = load_file(str(entry / "adapter_model.safetensors"), device="cpu")
             theta = {
-                peft_saved_name_to_parameter_name(name): tensor.float().contiguous()
-                for name, tensor in raw.items() if ".lora_A." in name or ".lora_B." in name
+                theta_name_from_saved(name): tensor.float().contiguous()
+                for name, tensor in raw.items() if is_saved_theta_name(name)
             }
             if not theta or tensor_map_sha256(theta) != metadata.get("theta_hash"):
                 return "drop", None
@@ -1301,7 +1329,13 @@ def main() -> None:
             if model_shape is None:
                 print(f"NOTE: {model_dir}/config.json not found; the initial adapter is checked for "
                       "structure only, and workers verify the exact tensor names and shapes.", flush=True)
-            initial_theta = load_initial_theta(args.initial_adapter_dir, model_shape=model_shape)
+            new_tokens = read_new_token_count(model_dir)
+            initial_theta = load_initial_theta(args.initial_adapter_dir, model_shape=model_shape,
+                                               new_tokens=new_tokens)
+            if new_tokens:
+                print(f"NOTE: {args.model_id} has {new_tokens} token ids beyond the RWKV World "
+                      f"vocabulary (ids {BASE_VOCAB_SIZE}..{BASE_VOCAB_SIZE + new_tokens - 1}); their embedding and LM-head "
+                      "rows are trained together with the LoRA.", flush=True)
         except FileNotFoundError as exc:
             parser.error(
                 f"cannot start from {args.initial_adapter_dir}: {exc}. Create a fresh rank-{LORA_RANK} "

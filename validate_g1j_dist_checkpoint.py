@@ -14,6 +14,8 @@ from peft import PeftModel
 from safetensors.torch import load_file
 from transformers import AutoModelForCausalLM
 
+from rwkv_new_tokens import NEW_TOKEN_TENSORS, attach_new_token_rows
+
 
 MODEL_PATH = Path("/workspace/RWKV7-G1j-1.5B-20260831")
 
@@ -21,12 +23,17 @@ MODEL_PATH = Path("/workspace/RWKV7-G1j-1.5B-20260831")
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--run-dir", type=Path, default=Path("runs/g1j_local_protocol/round-0001"))
+    parser.add_argument("--model-path", type=Path, default=MODEL_PATH,
+                        help="the base model the run trained (default: %(default)s)")
     args = parser.parse_args()
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required for adapter reload validation")
     theta = load_file(str(args.run_dir / "theta.safetensors"), device="cpu")
+    # Rows trained for token ids past the RWKV World vocabulary are not LoRA weights: PEFT
+    # ignores them, and they are checked and applied separately below.
+    rows = {name: theta.pop(name) for name in NEW_TOKEN_TENSORS if name in theta}
     model = AutoModelForCausalLM.from_pretrained(
-        str(MODEL_PATH),
+        str(args.model_path),
         trust_remote_code=True,
         local_files_only=True,
         use_safetensors=True,
@@ -46,6 +53,17 @@ def main() -> None:
     if max_diff != 0:
         raise RuntimeError(f"PEFT-loaded adapter differs from coordinator theta by {max_diff}")
 
+    if rows:
+        attached = attach_new_token_rows(model, hf_model=model.get_base_model())
+        if attached is None:
+            raise RuntimeError("theta holds new-token rows but the model has no token ids past 65535")
+        stored = load_file(str(args.run_dir / "adapter_model.safetensors"), device="cpu")
+        with torch.no_grad():
+            for name, value in rows.items():
+                if name not in stored or not torch.equal(stored[name], value):
+                    raise RuntimeError(f"{name} in adapter_model.safetensors differs from coordinator theta")
+                attached.get_parameter(name.split(".", 1)[1]).copy_(value)
+
     data_manifest = json.loads((args.run_dir / "data_manifest.json").read_text())
     unit = data_manifest["units"][0]
     input_ids = torch.tensor(unit["input_ids"], dtype=torch.long, device="cuda:0").unsqueeze(0)
@@ -64,6 +82,7 @@ def main() -> None:
     result = {
         "adapter_reload": "passed",
         "adapter_tensor_count": len(theta),
+        "new_token_rows": {name: list(value.shape) for name, value in rows.items()},
         "adapter_max_abs_difference_vs_coordinator_theta": max_diff,
         "probe_unit_id": unit["unit_id"],
         "probe_loss_tokens": unit["loss_tokens"],
