@@ -29,7 +29,8 @@ coordinator ───────────────────▶ worker 
 | `rwkv_hub.py` | Hugging Face 모델 내려받기, adapter push, Hub 체크포인트 조회 |
 | `rwkv_new_tokens.py` | 변환된 체크포인트가 어휘에 덧붙인 토큰(id 65536 이상)의 임베딩/헤드 행을 학습 가능하게 만드는 hook ([새 토큰 행 학습](#새-토큰-행-학습-변환된-체크포인트)) |
 | `prepare_g1j_protocol_units.py` | 샘플 unit manifest 생성 (4개 행짜리 프로토콜 검증용). `--model-id` 등으로 다른 모델의 tokenizer를 쓸 수 있음 |
-| `convert_k2_horizon/convert_pth_to_hf.py` | RWKV-7 G1 `.pth`를 K2 Horizon 형식(special token 추가, chat template)의 HF 체크포인트로 변환. 학습 코드와 별개의 도구이고 테스트하지 않았습니다. 결과에는 `release-manifest.json`이 없습니다 |
+| `convert_k2_horizon/convert_pth_to_hf.py` | RWKV-7 G1 `.pth`를 K2 Horizon 형식(special token 추가, chat template)의 HF 체크포인트로 변환. 학습 코드와 별개의 도구이고 테스트하지 않았습니다. 결과에는 `release-manifest.json`이 없으니 아래 스크립트로 만드세요 |
+| `convert_k2_horizon/make_release_manifest.py` | 변환한 체크포인트 폴더의 `release-manifest.json`을 만들고(`--check`로 복사본 검증). 표준 라이브러리만 씀 |
 | `make_initial_adapter.py` | 새 실행의 출발점이 되는 깨끗한 rank-8 LoRA adapter 생성 (CUDA 필요). 모델 크기는 모델 자체에서 읽음 |
 | `validate_g1j_sft_protocol.py` | TRL로 2 step 학습해 보는 프로토콜 검증 스크립트(adapter도 하나 남김) |
 | `validate_g1j_dist_checkpoint.py` | 결과 adapter가 PEFT로 로드되고 coordinator의 theta와 같은지 확인 |
@@ -202,7 +203,17 @@ RWKV World tokenizer의 id는 0..65535입니다. K2 Horizon처럼 다른 chat �
 
 **변환된 체크포인트를 쓰려면** 아직 맞춰야 할 것이 있습니다(직접 검증하지 못했습니다).
 
-- 이 프로젝트는 모델 폴더에 `release-manifest.json`(그 안의 `conversion.serialized_parameter_count` 포함)이 있고, 모델이 40자리 commit으로 고정된 Hugging Face repo이기를 기대합니다. 변환 스크립트는 `release-manifest.json`을 만들지 않으므로, 변환 결과를 자신의 HF repo에 올려 commit을 고정하고 그 폴더에 manifest를 두어야 합니다.
+- 이 프로젝트는 모델 폴더에 `release-manifest.json`(그 안의 `conversion.serialized_parameter_count` 포함)이 있고, 모델이 40자리 commit으로 고정된 Hugging Face repo이기를 기대합니다. 변환 스크립트는 manifest를 만들지 않으므로 `convert_k2_horizon/make_release_manifest.py`로 만듭니다.
+
+  ```bash
+  python convert_k2_horizon/convert_pth_to_hf.py --output /workspace/RWKV7-G1k-1.5B-k2-horizon-hf
+  python convert_k2_horizon/make_release_manifest.py /workspace/RWKV7-G1k-1.5B-k2-horizon-hf      # manifest 생성, 해시 출력
+  python convert_k2_horizon/make_release_manifest.py --check <복사한 폴더>                        # 다른 머신에서 검증
+  ```
+
+  manifest에는 폴더의 모든 파일(가중치, config, tokenizer, chat template, 모델 코드)의 크기와 SHA-256, safetensors 헤더에서 읽은 파라미터 수가 들어가고, 시각 같은 값이 없어서 같은 폴더면 항상 같은 바이트가 나옵니다. worker는 manifest의 해시만 비교하고 가중치는 다시 검사하지 않으므로, 폴더를 손으로 복사했다면 각 머신에서 `--check`를 돌려야 같은 가중치라는 보장이 됩니다. 폴더를 바꾸면 manifest 해시가 달라져서 이미 만든 토큰화 shard는 쓸 수 없고(`--force` 필요), shard를 다시 만들어야 합니다.
+  - **HF에 올리는 경우:** repo id와 push가 돌려준 commit sha를 `--model-id`/`--model-revision`에 씁니다. worker가 `--fetch-model-from-hf`로 내려받으려면 repo가 공개여야 합니다(worker는 토큰을 보내지 않습니다).
+  - **손으로 복사하는 경우:** `--model-id`는 `local/<이름>` 같은 아무 repo 형식 문자열이어도 되고, `--model-revision`에는 스크립트가 출력하는 "stand-in revision"(manifest 해시 앞 40자)을 씁니다. 이때는 `--fetch-model-from-hf`를 쓰지 마세요.
 - `prepare_g1j_protocol_units.py`는 `apply_chat_template(..., return_assistant_tokens_mask=True)`를 씁니다. K2 Horizon의 chat template은 assistant 턴을 `{% generation %}`으로 감싸 이 방식이 되는 것으로 보이지만, template 내용을 요약으로만 확인했는데, assistant 메시지에 reasoning 필드(`reasoning_content` 등)가 없으면 에러를 내는 것으로 보입니다. 실제 데이터로 실행해 확인해야 합니다. 이 스크립트의 데이터는 Capybara 4개 행으로 고정된 검증용입니다.
 - EOS가 여러 개(`eos_token_id` 목록)인 모델이어도 LoRA/새 행 스키마에는 영향이 없습니다.
 
@@ -333,7 +344,7 @@ python g1j_dist_coordinator.py ... \
 python -m unittest discover -p "test_*.py"
 ```
 
-GPU 없이 약 80초에 373개가 돕니다. worker 테스트는 `transformers`/`peft`를 가짜로 대체해서 제어 흐름을 검증합니다. `test_make_initial_adapter.py`는 반대로 진짜 PEFT를 쓰고(RWKV와 같은 모듈 구조의 빈 껍데기 모델 위에서, 24×2048 / 32×2560 / 32×4096), `transformers`/`peft`가 없으면(`requirements-worker.txt`를 설치하지 않으면) 건너뜁니다(44개, 나머지 329개는 그대로 통과). `test_model_schema.py`는 크기별 스키마와 모델 이름에서 파생되는 경로/실행 이름을, `test_prepare_units.py`는 `datasets`/tokenizer를 가짜로 대체해 데이터 shard가 모델 신원을 기록하고 coordinator가 그 모델에서만 받아들이는지를 검증합니다. `test_new_tokens.py`는 새 토큰 행의 델타가 "그 행을 직접 학습한 모델"과 같은 logits/gradient를 내는지(작은 모델과, PEFT·gradient checkpointing을 켠 작은 Llama 위에서), 기존 resume/Hub 테스트를 θ에 새 행을 넣어 다시 돌려 저장·push·복원이 되는지를, `test_worker_model.py`는 진짜 `load_worker_model`/`compute_unit`/`apply_snapshot`이 작은 Llama 위에서 새 행을 다루는지와 worker 번들이 import하는 모듈을 빠짐없이 담는지를 검증합니다. coordinator 테스트는 실제 HTTP 서버를 띄워 합성 gradient로 여러 round, 재시작, Hub 왕복(가짜 Hub)까지 검증합니다. 실제 모델 계산, 실제 Hugging Face 서버 호출, 여러 GPU 동시 실행은 이 테스트에 포함되지 않습니다.
+GPU 없이 약 80초에 404개가 돕니다. worker 테스트는 `transformers`/`peft`를 가짜로 대체해서 제어 흐름을 검증합니다. `test_make_initial_adapter.py`는 반대로 진짜 PEFT를 쓰고(RWKV와 같은 모듈 구조의 빈 껍데기 모델 위에서, 24×2048 / 32×2560 / 32×4096), `transformers`/`peft`가 없으면(`requirements-worker.txt`를 설치하지 않으면) 건너뜁니다(44개, 나머지 360개는 그대로 통과). `test_model_schema.py`는 크기별 스키마와 모델 이름에서 파생되는 경로/실행 이름을, `test_prepare_units.py`는 `datasets`/tokenizer를 가짜로 대체해 데이터 shard가 모델 신원을 기록하고 coordinator가 그 모델에서만 받아들이는지를 검증합니다. `test_new_tokens.py`는 새 토큰 행의 델타가 "그 행을 직접 학습한 모델"과 같은 logits/gradient를 내는지(작은 모델과, PEFT·gradient checkpointing을 켠 작은 Llama 위에서), 기존 resume/Hub 테스트를 θ에 새 행을 넣어 다시 돌려 저장·push·복원이 되는지를, `test_worker_model.py`는 진짜 `load_worker_model`/`compute_unit`/`apply_snapshot`이 작은 Llama 위에서 새 행을 다루는지와 worker 번들이 import하는 모듈을 빠짐없이 담는지를 검증합니다. `test_release_manifest.py`는 작은 safetensors 폴더로 manifest 생성(결정성, 파라미터 수, 샤드 합산, 훼손/누락/추가 파일 감지)과, 그 폴더를 coordinator가 실제로 받아들이는지를 검증합니다. coordinator 테스트는 실제 HTTP 서버를 띄워 합성 gradient로 여러 round, 재시작, Hub 왕복(가짜 Hub)까지 검증합니다. 실제 모델 계산, 실제 Hugging Face 서버 호출, 여러 GPU 동시 실행은 이 테스트에 포함되지 않습니다.
 
 ## 보안과 한계
 
