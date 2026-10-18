@@ -1,0 +1,9 @@
+# Data preparation and the TRL protocol check:
+#   prepare_g1j_protocol_units.py, validate_g1j_sft_protocol.py
+#
+#   pip install -r requirements-data.txt
+#
+# Versions are the ones recorded in g1j_1.5b_sft_protocol_validation.json.
+-r requirements-worker.txt
+datasets==5.1.0
+trl==1.16.0

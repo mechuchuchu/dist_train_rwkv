@@ -1,0 +1,17 @@
+# Worker (g1j_dist_worker.py) and make_initial_adapter.py: needs a CUDA GPU.
+#
+#   pip install torch==2.14.1 --index-url https://download.pytorch.org/whl/cu126
+#   pip install -r requirements-worker.txt
+#
+# These three are exactly the versions the GPU validation runs recorded
+# (torch 2.14.1+cu126, transformers 5.20.1, peft 0.21.2, accelerate 1.15.0).
+# Keep transformers pinned: the base model's remote code uses
+# transformers.initialization and transformers.cache_utils.LinearAttentionLayer,
+# and the worker's trainable-parameter names depend on the PEFT version.
+# The pinned model revision's remote code imports nothing beyond torch and
+# transformers (no flash-linear-attention, triton or einops).
+-r requirements.txt
+transformers==5.20.1
+peft==0.21.2
+# device_map / low_cpu_mem_usage loading needs it; peft depends on it as well.
+accelerate==1.15.0

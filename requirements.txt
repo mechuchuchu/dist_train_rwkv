@@ -1,0 +1,21 @@
+# Coordinator, protocol/checkpoint tests and anything else that needs no GPU.
+#
+#   pip install -r requirements.txt
+#
+# is enough to run g1j_dist_coordinator.py and the CPU test suite (the tests
+# that need transformers/peft are skipped without requirements-worker.txt).
+#
+# Tested with Python 3.13, torch 2.14.1 (CPU build), safetensors 0.8.0,
+# numpy 2.5.4 and huggingface_hub 2.2.0.
+#
+# torch: the coordinator does not use a GPU, but the default PyPI wheel on
+# Linux normally ships the CUDA libraries (several GB). Install the build you
+# want first, from the matching PyTorch index, then this file:
+#   CPU only:   pip install torch==2.14.1 --index-url https://download.pytorch.org/whl/cpu
+#   CUDA 12.6:  pip install torch==2.14.1 --index-url https://download.pytorch.org/whl/cu126
+# (the GPU runs in this repo used 2.14.1+cu126; "==2.14.1" matches either build).
+torch==2.14.1
+safetensors>=0.8.0
+numpy
+# Same bounds as transformers 5.20.1, so one environment can hold both.
+huggingface_hub>=1.31.0,<3

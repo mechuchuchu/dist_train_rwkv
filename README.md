@@ -31,17 +31,36 @@ coordinator ───────────────────▶ worker 
 | `make_initial_adapter.py` | 새 실행의 출발점이 되는 깨끗한 rank-8 LoRA adapter 생성 (CUDA 필요) |
 | `validate_g1j_sft_protocol.py` | TRL로 2 step 학습해 보는 프로토콜 검증 스크립트(adapter도 하나 남김) |
 | `validate_g1j_dist_checkpoint.py` | 결과 adapter가 PEFT로 로드되고 coordinator의 theta와 같은지 확인 |
+| `requirements*.txt` | 역할별 의존성: coordinator / worker / 데이터 준비 ([요구사항](#요구사항)) |
 | `test_*.py` | 단위/통합 테스트 (CPU) |
 | `*Design*.md`, `G1j_1.5B_Training_Protocol_Validation_*.md`, `VRAM_Baseline_*.md` | 설계, 검증 기록, VRAM 측정 |
 | `profile_*.py`, `*.json` | 단일 GPU VRAM 프로파일 스크립트와 결과 |
 
 ## 요구사항
 
-- **Python.** 개발은 PyTorch 2.14.1(cu126), Transformers 5.20.1, PEFT 0.21.2 환경(`/venv/main`)에서 했고, 테스트는 Python 3.13 / CPU 전용 torch에서도 돌려 봤습니다. 더 낮은 Python 버전은 확인하지 않았습니다. 의존성 목록 파일(`requirements.txt`)은 아직 없습니다.
-- **coordinator:** `torch`(CPU면 충분), `safetensors`, `numpy`, `huggingface_hub`(Hub 기능에만). GPU가 필요 없고, 모델 가중치도 필요 없습니다. `--model-dir`에 `release-manifest.json`이 있는 폴더만 있으면 해시 확인에 쓰입니다.
-- **worker:** CUDA GPU, `torch`(CUDA), `transformers`, `peft`, 그리고 BF16 base 모델 스냅샷. 1.5B는 RTX 3060 12 GiB에서 검증했습니다.
-- 초기 adapter 생성(`make_initial_adapter.py`)은 worker와 같은 환경(CUDA, `transformers`, `peft`, base 모델)에서 돌립니다.
-- 데이터 준비/검증 스크립트는 추가로 `datasets`, `trl`이 필요합니다.
+역할별로 의존성 파일이 나뉘어 있습니다. 파일마다 맨 위 주석에 검증한 버전과 설치 방법이 있습니다.
+
+| 파일 | 용도 | 포함 |
+| --- | --- | --- |
+| `requirements.txt` | coordinator, CPU 테스트 | `torch`, `safetensors`, `numpy`, `huggingface_hub` |
+| `requirements-worker.txt` | worker, `make_initial_adapter.py` (CUDA GPU 필요) | 위 + `transformers`, `peft`, `accelerate` |
+| `requirements-data.txt` | `prepare_g1j_protocol_units.py`, `validate_g1j_sft_protocol.py` | 위 + `datasets`, `trl` |
+
+```bash
+# coordinator (GPU 불필요). PyPI의 torch는 CUDA 라이브러리까지 받으므로, CPU 빌드를 먼저 설치하는 편이 가볍습니다
+pip install torch==2.14.1 --index-url https://download.pytorch.org/whl/cpu
+pip install -r requirements.txt
+
+# worker
+pip install torch==2.14.1 --index-url https://download.pytorch.org/whl/cu126
+pip install -r requirements-worker.txt
+```
+
+- **버전.** `torch` / `transformers` / `peft` / `accelerate`는 GPU 검증 기록(`torch 2.14.1+cu126`, `transformers 5.20.1`, `peft 0.21.2`, `accelerate 1.15.0`)과 같은 값으로 고정했습니다. `transformers`는 base 모델의 remote code가 최신 API(`transformers.initialization`, `LinearAttentionLayer`)를 쓰고 PEFT 버전이 학습 파라미터 이름에 영향을 주므로, 올릴 때는 GPU에서 다시 확인하세요. `safetensors` / `numpy` / `huggingface_hub`는 테스트한 버전(0.8.0 / 2.5.4 / 2.2.0) 이상이면 됩니다.
+- **검증 범위.** 세 파일 모두 pip 의존성 해석이 충돌 없이 되는 것까지 확인했고, 스크립트들의 `import`가 각 파일에 모두 들어 있는지 대조했습니다. 고정한 버전으로 새 가상환경을 만들어 전체 테스트를 돌려 본 것은 아닙니다(테스트 환경은 CPU torch 2.14.1, Python 3.13이고, Python 3.12 이하는 확인하지 않았습니다).
+- **worker.** CUDA GPU, BF16 base 모델 스냅샷. 1.5B는 RTX 3060 12 GiB에서 검증했습니다. 고정한 모델 revision의 remote code(`modeling_rwkv7.py`, `tokenization_rwkv7.py`)는 `torch`와 `transformers` 외에는 import하지 않습니다(Hugging Face에서 해당 revision의 소스를 읽어 확인).
+- **coordinator.** GPU도 모델 가중치도 필요 없습니다. `--model-dir`에 `release-manifest.json`이 있는 폴더만 있으면 해시 확인에 쓰입니다. `huggingface_hub`는 Hub 기능에만 쓰입니다.
+- `profile_*.py` 스크립트(QLoRA / VRAM 측정)는 추가로 `bitsandbytes`(기록상 0.50.2)와 `psutil`이 필요하고, 위 파일에는 넣지 않았습니다.
 - 모든 요청은 공유 토큰(`Authorization: Bearer ...`)으로 인증합니다. 토큰은 환경 변수 `RWKV_PROTOCOL_TOKEN`으로 넘기는 편이 좋습니다(명령행 인자는 `ps`에 보입니다).
 
 ## 빠른 시작
@@ -215,7 +234,7 @@ python g1j_dist_coordinator.py ... \
 python -m unittest discover -p "test_*.py"
 ```
 
-GPU 없이 약 40초에 161개가 돕니다. worker 테스트는 `transformers`/`peft`를 가짜로 대체해서 제어 흐름을 검증합니다. `test_make_initial_adapter.py`는 반대로 진짜 PEFT를 쓰고(RWKV와 같은 모듈 구조의 빈 껍데기 모델 위에서), `transformers`/`peft`가 없으면 건너뜁니다(25개). coordinator 테스트는 실제 HTTP 서버를 띄워 합성 gradient로 여러 round, 재시작, Hub 왕복(가짜 Hub)까지 검증합니다. 실제 모델 계산, 실제 Hugging Face 서버 호출, 여러 GPU 동시 실행은 이 테스트에 포함되지 않습니다.
+GPU 없이 약 40초에 161개가 돕니다. worker 테스트는 `transformers`/`peft`를 가짜로 대체해서 제어 흐름을 검증합니다. `test_make_initial_adapter.py`는 반대로 진짜 PEFT를 쓰고(RWKV와 같은 모듈 구조의 빈 껍데기 모델 위에서), `transformers`/`peft`가 없으면(`requirements-worker.txt`를 설치하지 않으면) 건너뜁니다(25개). coordinator 테스트는 실제 HTTP 서버를 띄워 합성 gradient로 여러 round, 재시작, Hub 왕복(가짜 Hub)까지 검증합니다. 실제 모델 계산, 실제 Hugging Face 서버 호출, 여러 GPU 동시 실행은 이 테스트에 포함되지 않습니다.
 
 ## 보안과 한계
 
